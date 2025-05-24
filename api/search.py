@@ -1,5 +1,5 @@
 # LifeKB Backend Search API - Vercel Serverless Function
-# Purpose: Semantic search operations using OpenAI embeddings
+# Purpose: Semantic search operations using OpenAI embeddings with metadata filtering
 
 from http.server import BaseHTTPRequestHandler
 import json
@@ -9,6 +9,7 @@ import sys
 import asyncio
 from datetime import datetime
 from uuid import UUID
+from typing import List, Optional
 
 # Add parent directory to path for imports
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -19,6 +20,24 @@ try:
 except ImportError:
     embeddings_manager = None
     EmbeddingsError = Exception
+
+# Import monitoring and security
+from app.monitoring import performance_monitor, rate_limiter, create_logger
+
+# Supabase imports
+from supabase import create_client, Client
+
+logger = create_logger("search_api")
+
+def get_supabase_client():
+    """Initialize and return Supabase client."""
+    url = os.environ.get("SUPABASE_URL")
+    key = os.environ.get("SUPABASE_SERVICE_KEY")
+    
+    if not url or not key:
+        raise ValueError("SUPABASE_URL and SUPABASE_SERVICE_KEY must be set in environment")
+    
+    return create_client(url, key)
 
 def serialize_datetime(obj):
     """Convert datetime objects to ISO format strings for JSON serialization."""
@@ -52,62 +71,89 @@ class ValidationError(Exception):
     """Custom exception for validation errors."""
     pass
 
-def extract_user_from_token(authorization_header):
-    """Extract user ID from JWT token in Authorization header."""
-    if not authorization_header:
-        raise AuthError("Authorization header required")
-    
-    if not authorization_header.startswith('Bearer '):
-        raise AuthError("Invalid authorization header format")
-    
-    token = authorization_header[7:]  # Remove 'Bearer ' prefix
-    
-    # For development, we'll decode without verification
-    # In production, this should verify the JWT signature
-    import jwt
+def get_user_from_token(token: str):
+    """Get user data from JWT token."""
     try:
-        if os.environ.get("ENVIRONMENT") == "development":
-            decoded = jwt.decode(token, options={"verify_signature": False})
-        else:
-            jwt_secret = os.environ.get("JWT_SECRET_KEY")
-            if not jwt_secret:
-                raise AuthError("JWT_SECRET_KEY not configured")
-            decoded = jwt.decode(token, jwt_secret, algorithms=["HS256"])
+        supabase = get_supabase_client()
+        response = supabase.auth.get_user(token)
         
-        user_id = decoded.get('sub')
-        if not user_id:
-            raise AuthError("Invalid token: missing user ID")
+        if not response.user:
+            raise AuthError("Invalid token")
         
-        return user_id
-        
-    except jwt.ExpiredSignatureError:
-        raise AuthError("Token has expired")
-    except jwt.InvalidTokenError:
-        raise AuthError("Invalid token")
+        return response.user
     except Exception as e:
-        raise AuthError(f"Token validation error: {str(e)}")
+        raise AuthError(f"Authentication failed: {str(e)}")
 
-async def perform_semantic_search(user_id: str, query: str, limit: int = 10, similarity_threshold: float = 0.1):
-    """Perform semantic search on user's journal entries."""
+@rate_limiter.limit_requests(max_requests=50, window_minutes=1)  # 50 searches per minute
+@performance_monitor.track_request("/api/search", "POST")
+async def perform_semantic_search_with_metadata(
+    user_id: str, 
+    query: str, 
+    limit: int = 10, 
+    similarity_threshold: float = 0.1,
+    filter_tags: Optional[List[str]] = None,
+    filter_category: Optional[str] = None,
+    min_mood: Optional[int] = None,
+    max_mood: Optional[int] = None
+):
+    """Perform semantic search with metadata filtering."""
     try:
         if not embeddings_manager:
             raise Exception("Embeddings manager not available")
         
-        user_uuid = UUID(user_id)
-        results = await embeddings_manager.search_similar_entries(
-            user_uuid, 
-            query, 
-            limit, 
-            similarity_threshold
-        )
+        # First generate query embedding
+        query_embedding = await embeddings_manager.generate_embedding(query)
         
-        return serialize_data(results)
+        # Use the metadata search function directly
+        supabase = get_supabase_client()
         
-    except EmbeddingsError as e:
-        raise Exception(f"Search error: {str(e)}")
+        # Call the search_entries_with_metadata function
+        result = supabase.rpc('search_entries_with_metadata', {
+            'query_embedding': query_embedding,
+            'target_user_id': user_id,
+            'similarity_threshold': similarity_threshold,
+            'limit_count': limit,
+            'filter_tags': filter_tags,
+            'filter_category': filter_category,
+            'min_mood': min_mood,
+            'max_mood': max_mood
+        }).execute()
+        
+        # Format results
+        search_results = []
+        if result.data:
+            for row in result.data:
+                search_results.append({
+                    "id": row["id"],
+                    "text": row["text"],
+                    "tags": row["tags"],
+                    "category": row["category"],
+                    "mood": row["mood"],
+                    "location": row["location"],
+                    "weather": row["weather"],
+                    "created_at": row["created_at"],
+                    "similarity": float(row["similarity"])
+                })
+        
+        logger.info("Semantic search with metadata completed", 
+                   user_id=user_id, query_length=len(query), 
+                   results_count=len(search_results), 
+                   has_filters=bool(filter_tags or filter_category or min_mood or max_mood))
+        
+        return serialize_data(search_results)
+        
     except Exception as e:
+        logger.error("Search with metadata failed", user_id=user_id, error=str(e))
         raise Exception(f"Search failed: {str(e)}")
 
+async def perform_semantic_search(user_id: str, query: str, limit: int = 10, similarity_threshold: float = 0.1):
+    """Perform basic semantic search (backward compatibility)."""
+    return await perform_semantic_search_with_metadata(
+        user_id, query, limit, similarity_threshold
+    )
+
+@rate_limiter.limit_requests(max_requests=10, window_minutes=1)  # 10 processing requests per minute
+@performance_monitor.track_request("/api/search", "GET")
 async def process_pending_embeddings(user_id: str, limit: int = 5):
     """Process pending embeddings for a user."""
     try:
@@ -117,13 +163,18 @@ async def process_pending_embeddings(user_id: str, limit: int = 5):
         user_uuid = UUID(user_id)
         result = await embeddings_manager.process_pending_embeddings(user_uuid, limit)
         
+        logger.info("Pending embeddings processed", user_id=user_id, processed_count=limit)
+        
         return serialize_data(result)
         
     except EmbeddingsError as e:
+        logger.error("Embedding processing failed", user_id=user_id, error=str(e))
         raise Exception(f"Embedding processing error: {str(e)}")
     except Exception as e:
+        logger.error("Processing failed", user_id=user_id, error=str(e))
         raise Exception(f"Processing failed: {str(e)}")
 
+@performance_monitor.track_request("/api/search", "GET")
 async def get_embedding_status(user_id: str):
     """Get embedding generation status for a user."""
     try:
@@ -136,8 +187,10 @@ async def get_embedding_status(user_id: str):
         return serialize_data(status)
         
     except EmbeddingsError as e:
+        logger.error("Status check failed", user_id=user_id, error=str(e))
         raise Exception(f"Status error: {str(e)}")
     except Exception as e:
+        logger.error("Status check failed", user_id=user_id, error=str(e))
         raise Exception(f"Status check failed: {str(e)}")
 
 class handler(BaseHTTPRequestHandler):
@@ -161,15 +214,22 @@ class handler(BaseHTTPRequestHandler):
             post_data = self.rfile.read(content_length)
             return json.loads(post_data.decode('utf-8'))
         except (json.JSONDecodeError, ValueError):
+            logger.warn("Failed to parse request body")
             return {}
 
     def get_user_id(self) -> str:
-        """Extract and validate user ID from authorization header."""
-        auth_header = self.headers.get('Authorization')
-        return extract_user_from_token(auth_header)
+        """Extract and validate user ID from JWT token."""
+        auth_header = self.headers.get('Authorization', '')
+        if not auth_header.startswith('Bearer '):
+            raise AuthError('Missing or invalid Authorization header')
+        
+        token = auth_header.replace('Bearer ', '')
+        user = get_user_from_token(token)
+        
+        return str(user.id)
 
     def do_GET(self):
-        """Handle GET requests - embedding status."""
+        """Handle GET requests - embedding status and processing."""
         try:
             user_id = self.get_user_id()
             
@@ -205,25 +265,37 @@ class handler(BaseHTTPRequestHandler):
                 # Default API info
                 loop.close()
                 self.send_json_response(200, {
-                    'message': 'LifeKB Search API',
-                    'version': '1.0.0',
+                    'message': 'LifeKB Search API with Metadata Filtering',
+                    'version': '2.0.0',
                     'endpoints': {
                         'GET': [
                             '?action=status - Get embedding status',
                             '?action=process - Process pending embeddings'
                         ],
-                        'POST': ['Search entries with semantic similarity']
+                        'POST': [
+                            'Search entries with semantic similarity and metadata filters',
+                            'Supports: tags, category, mood range filtering'
+                        ]
                     },
+                    'features': [
+                        'Semantic search with OpenAI embeddings',
+                        'Tag-based filtering',
+                        'Category filtering',
+                        'Mood range filtering',
+                        'Location and weather filtering',
+                        'Real-time processing status'
+                    ],
                     'status': 'running'
                 })
             
         except AuthError as e:
             self.send_json_response(401, {'error': str(e)})
         except Exception as e:
+            logger.error("GET request failed", error=str(e))
             self.send_json_response(500, {'error': f'Internal server error: {str(e)}'})
 
     def do_POST(self):
-        """Handle POST requests - semantic search."""
+        """Handle POST requests - semantic search with metadata filtering."""
         try:
             user_id = self.get_user_id()
             body = self.get_request_body()
@@ -232,6 +304,7 @@ class handler(BaseHTTPRequestHandler):
             if not query:
                 raise ValidationError('Search query is required')
             
+            # Basic search parameters
             limit = min(int(body.get('limit', 10)), 50)  # Max 50 results
             similarity_threshold = float(body.get('similarity_threshold', 0.1))
             
@@ -239,19 +312,48 @@ class handler(BaseHTTPRequestHandler):
             if not 0.0 <= similarity_threshold <= 1.0:
                 raise ValidationError('Similarity threshold must be between 0.0 and 1.0')
             
+            # Extract metadata filters
+            filters = body.get('filters', {})
+            filter_tags = filters.get('tags') if filters else None
+            filter_category = filters.get('category') if filters else None
+            min_mood = filters.get('min_mood') if filters else None
+            max_mood = filters.get('max_mood') if filters else None
+            
+            # Validate filters
+            if min_mood is not None and (min_mood < 1 or min_mood > 10):
+                raise ValidationError('min_mood must be between 1 and 10')
+            if max_mood is not None and (max_mood < 1 or max_mood > 10):
+                raise ValidationError('max_mood must be between 1 and 10')
+            if min_mood is not None and max_mood is not None and min_mood > max_mood:
+                raise ValidationError('min_mood cannot be greater than max_mood')
+            
+            start_time = datetime.utcnow()
+            
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
             results = loop.run_until_complete(
-                perform_semantic_search(user_id, query, limit, similarity_threshold)
+                perform_semantic_search_with_metadata(
+                    user_id, query, limit, similarity_threshold,
+                    filter_tags, filter_category, min_mood, max_mood
+                )
             )
             loop.close()
+            
+            search_time_ms = (datetime.utcnow() - start_time).total_seconds() * 1000
             
             self.send_json_response(200, {
                 'success': True,
                 'query': query,
                 'results': results,
-                'count': len(results),
-                'similarity_threshold': similarity_threshold
+                'total_count': len(results),
+                'similarity_threshold': similarity_threshold,
+                'filters_applied': {
+                    'tags': filter_tags,
+                    'category': filter_category,
+                    'min_mood': min_mood,
+                    'max_mood': max_mood
+                },
+                'search_time_ms': round(search_time_ms, 2)
             })
             
         except AuthError as e:
@@ -259,6 +361,7 @@ class handler(BaseHTTPRequestHandler):
         except ValidationError as e:
             self.send_json_response(400, {'error': str(e)})
         except Exception as e:
+            logger.error("POST request failed", error=str(e))
             self.send_json_response(500, {'error': f'Internal server error: {str(e)}'})
 
     def do_OPTIONS(self):
