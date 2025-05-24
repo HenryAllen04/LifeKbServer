@@ -1,230 +1,420 @@
-# LifeKB Backend Auth API
-# Purpose: Authentication endpoints for user login, signup, and token management
+# LifeKB Backend Auth API - Vercel Serverless Function
+# Purpose: Real authentication endpoints using Supabase Auth with monitoring and security
 
-from fastapi import FastAPI, HTTPException, status, Request
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import ValidationError
-import os
+from http.server import BaseHTTPRequestHandler
 import json
-import logging
-
-# Import our app modules
+import urllib.parse
+import os
 import sys
-sys.path.append('/var/task')
-from app.models import LoginRequest, UserCreate, AuthTokens, RefreshTokenRequest, APIError
-from app.auth import auth_manager
-from app.utils import create_error_response, create_success_response, setup_logging, get_client_ip, rate_limiter
+import asyncio
+from datetime import datetime
 
-# Setup logging
-setup_logging(os.getenv("LOG_LEVEL", "INFO"))
-logger = logging.getLogger(__name__)
+# Supabase imports
+from supabase import create_client, Client
 
-# Create FastAPI app
-app = FastAPI(
-    title="LifeKB Auth API",
-    description="Authentication endpoints for the privacy-first journaling app",
-    version="1.0.0"
+# Enhanced monitoring and security
+from app.monitoring import (
+    performance_monitor, rate_limiter, security_monitor, 
+    create_logger
 )
 
-# CORS middleware
-cors_origins = json.loads(os.getenv("CORS_ORIGINS", '["http://localhost:3000"]'))
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=cors_origins,
-    allow_credentials=True,
-    allow_methods=["GET", "POST", "PUT", "DELETE"],
-    allow_headers=["*"],
-)
+logger = create_logger("auth_api")
 
+def serialize_datetime(obj):
+    """Convert datetime objects to ISO format strings for JSON serialization."""
+    if isinstance(obj, datetime):
+        return obj.isoformat()
+    elif hasattr(obj, 'isoformat'):  # Handle other datetime-like objects
+        return obj.isoformat()
+    return obj
 
-@app.middleware("http")
-async def rate_limit_middleware(request: Request, call_next):
-    """Rate limiting middleware"""
-    client_ip = get_client_ip(request)
-    
-    if not rate_limiter.is_allowed(client_ip):
-        return HTTPException(
-            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-            detail="Rate limit exceeded. Please try again later."
-        )
-    
-    response = await call_next(request)
-    return response
+def serialize_user_data(data):
+    """Recursively serialize datetime objects in user data."""
+    if isinstance(data, dict):
+        result = {}
+        for key, value in data.items():
+            try:
+                result[key] = serialize_user_data(value)
+            except Exception as e:
+                # Convert problematic values to strings
+                result[key] = str(value)
+        return result
+    elif isinstance(data, list):
+        return [serialize_user_data(item) for item in data]
+    else:
+        return serialize_datetime(data)
 
+# Initialize Supabase client
+def get_supabase_client():
+    """Initialize and return Supabase client with environment variables."""
+    url = os.environ.get("SUPABASE_URL")
+    key = os.environ.get("SUPABASE_SERVICE_KEY")
+    
+    if not url or not key:
+        raise ValueError("SUPABASE_URL and SUPABASE_SERVICE_KEY must be set in environment")
+    
+    return create_client(url, key)
 
-@app.post("/login", response_model=AuthTokens)
-async def login(request: LoginRequest):
-    """
-    Authenticate user and return access tokens
+class AuthError(Exception):
+    """Custom exception for authentication errors."""
+    pass
+
+@rate_limiter.limit_requests(max_requests=5, window_minutes=1)  # 5 login attempts per minute
+@performance_monitor.track_request("/api/auth", "POST")
+async def authenticate_user(email: str, password: str, ip_address: str = "unknown"):
+    """Authenticate user with Supabase Auth."""
+    logger.info("Authentication attempt started", email=email, ip_address=ip_address)
     
-    Args:
-        request: Login credentials (email and password)
-    
-    Returns:
-        AuthTokens: Access token, refresh token, and metadata
-        
-    Raises:
-        HTTPException: 401 for invalid credentials, 400 for other errors
-    """
     try:
-        logger.info(f"Login attempt for email: {request.email}")
+        # Input validation and security checks
+        security_monitor.validate_input_size("email", email, 254)  # RFC 5321 limit
+        security_monitor.validate_input_size("password", password, 128)  # Reasonable password limit
         
-        # Authenticate user
-        auth_result = await auth_manager.sign_in(request.email, request.password)
+        if not security_monitor.check_content_safety(email):
+            raise AuthError("Invalid email format")
         
-        # Extract session info
-        session = auth_result["session"]
+        supabase = get_supabase_client()
+        response = supabase.auth.sign_in_with_password({
+            "email": email,
+            "password": password
+        })
         
-        response = AuthTokens(
-            access_token=session["access_token"],
-            refresh_token=session["refresh_token"],
-            token_type=session["token_type"],
-            expires_in=session["expires_in"]
-        )
+        if not response.user:
+            # Log failed authentication
+            security_monitor.log_auth_attempt(email, False, ip_address)
+            raise AuthError("Invalid credentials")
         
-        logger.info(f"Successful login for user: {auth_result['user']['id']}")
-        return response
+        # Log successful authentication
+        security_monitor.log_auth_attempt(email, True, ip_address)
         
-    except HTTPException:
-        raise
+        result = {
+            "user": {
+                "id": response.user.id,
+                "email": response.user.email,
+                "created_at": response.user.created_at
+            },
+            "session": {
+                "access_token": response.session.access_token,
+                "refresh_token": response.session.refresh_token,
+                "expires_at": response.session.expires_at
+            }
+        }
+        
+        logger.info("Authentication successful", email=email, user_id=response.user.id)
+        
+        # Serialize datetime objects
+        return serialize_user_data(result)
+        
     except Exception as e:
-        logger.error(f"Login error: {str(e)}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Authentication service unavailable"
-        )
-
-
-@app.post("/signup", response_model=AuthTokens)
-async def signup(request: UserCreate):
-    """
-    Register a new user account
-    
-    Args:
-        request: User registration data (email and password)
-    
-    Returns:
-        AuthTokens: Access token, refresh token, and metadata (if email confirmation not required)
+        logger.error("Authentication failed", email=email, error=str(e))
+        security_monitor.log_auth_attempt(email, False, ip_address)
         
-    Raises:
-        HTTPException: 409 for existing user, 400 for validation errors
-    """
+        if "Invalid login credentials" in str(e):
+            raise AuthError("Invalid email or password")
+        raise AuthError(f"Authentication failed: {str(e)}")
+
+@rate_limiter.limit_requests(max_requests=3, window_minutes=5)  # 3 registrations per 5 minutes
+@performance_monitor.track_request("/api/auth", "POST")
+async def register_user(email: str, password: str, ip_address: str = "unknown"):
+    """Register new user with Supabase Auth."""
+    logger.info("User registration attempt started", email=email, ip_address=ip_address)
+    
     try:
-        logger.info(f"Signup attempt for email: {request.email}")
+        # Enhanced input validation
+        security_monitor.validate_input_size("email", email, 254)
+        security_monitor.validate_input_size("password", password, 128)
         
-        # Create user account
-        auth_result = await auth_manager.sign_up(request.email, request.password)
+        if not security_monitor.check_content_safety(email):
+            raise AuthError("Invalid email format")
         
-        # Check if we have a session (email confirmation might be required)
-        if auth_result["session"]:
-            session = auth_result["session"]
+        # Basic password strength check
+        if len(password) < 8:
+            raise AuthError("Password must be at least 8 characters long")
+        
+        supabase = get_supabase_client()
+        response = supabase.auth.sign_up({
+            "email": email,
+            "password": password
+        })
+        
+        if not response.user:
+            raise AuthError("Failed to create user account")
+        
+        result = {
+            "user": {
+                "id": response.user.id,
+                "email": response.user.email,
+                "created_at": response.user.created_at,
+                "email_confirmed": response.user.email_confirmed_at is not None
+            },
+            "session": {
+                "access_token": response.session.access_token if response.session else None,
+                "refresh_token": response.session.refresh_token if response.session else None
+            } if response.session else None
+        }
+        
+        logger.info("User registration successful", email=email, user_id=response.user.id)
+        
+        # Serialize datetime objects
+        return serialize_user_data(result)
+        
+    except Exception as e:
+        logger.error("User registration failed", email=email, error=str(e))
+        
+        if "already registered" in str(e).lower():
+            raise AuthError("User with this email already exists")
+        raise AuthError(f"Registration failed: {str(e)}")
+
+@rate_limiter.limit_requests(max_requests=10, window_minutes=5)  # 10 refresh attempts per 5 minutes
+@performance_monitor.track_request("/api/auth", "POST")
+async def refresh_token(refresh_token: str):
+    """Refresh user session using refresh token."""
+    logger.info("Token refresh attempt started")
+    
+    try:
+        # Input validation
+        security_monitor.validate_input_size("refresh_token", refresh_token, 1024)  # JWT tokens are typically < 1KB
+        
+        supabase = get_supabase_client()
+        response = supabase.auth.refresh_session(refresh_token)
+        
+        if not response.session:
+            logger.warn("Token refresh failed - invalid token")
+            raise AuthError("Invalid refresh token")
+        
+        result = {
+            "session": {
+                "access_token": response.session.access_token,
+                "refresh_token": response.session.refresh_token,
+                "expires_at": response.session.expires_at
+            },
+            "user": {
+                "id": response.user.id,
+                "email": response.user.email
+            } if response.user else None
+        }
+        
+        logger.info("Token refresh successful", user_id=response.user.id if response.user else "unknown")
+        
+        # Serialize datetime objects
+        return serialize_user_data(result)
+        
+    except Exception as e:
+        logger.error("Token refresh failed", error=str(e))
+        raise AuthError(f"Token refresh failed: {str(e)}")
+
+@performance_monitor.track_request("/api/auth", "GET")
+async def test_connection():
+    """Test database connection and return basic info."""
+    logger.info("Database connection test requested")
+    
+    try:
+        supabase = get_supabase_client()
+        # Simple query to test connection
+        response = supabase.table('journal_entries').select('count', count='exact').execute()
+        
+        result = {
+            "status": "connected",
+            "url": os.environ.get("SUPABASE_URL"),
+            "table_exists": True
+        }
+        
+        logger.info("Database connection test successful")
+        return result
+        
+    except Exception as e:
+        logger.error("Database connection test failed", error=str(e))
+        return {
+            "status": "error",
+            "error": str(e),
+            "url": os.environ.get("SUPABASE_URL")
+        }
+
+class handler(BaseHTTPRequestHandler):
+    def send_json_response(self, status_code: int, data: dict):
+        """Helper to send JSON responses with proper headers."""
+        self.send_response(status_code)
+        self.send_header('Content-Type', 'application/json')
+        self.send_header('Access-Control-Allow-Origin', '*')
+        self.send_header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')
+        self.send_header('Access-Control-Allow-Headers', 'Content-Type, Authorization')
+        self.end_headers()
+        self.wfile.write(json.dumps(data).encode('utf-8'))
+
+    def get_request_body(self) -> dict:
+        """Parse JSON request body."""
+        try:
+            content_length = int(self.headers.get('Content-Length', 0))
+            if content_length == 0:
+                return {}
             
-            response = AuthTokens(
-                access_token=session["access_token"],
-                refresh_token=session["refresh_token"],
-                token_type=session["token_type"],
-                expires_in=session["expires_in"]
-            )
-            
-            logger.info(f"Successful signup for user: {auth_result['user']['id']}")
-            return response
+            post_data = self.rfile.read(content_length)
+            return json.loads(post_data.decode('utf-8'))
+        except (json.JSONDecodeError, ValueError):
+            logger.warn("Failed to parse request body")
+            return {}
+
+    def get_client_ip(self) -> str:
+        """Extract client IP address for security monitoring."""
+        # Check headers for real IP (from proxies/load balancers)
+        forwarded_for = self.headers.get('X-Forwarded-For')
+        if forwarded_for:
+            return forwarded_for.split(',')[0].strip()
+        
+        real_ip = self.headers.get('X-Real-IP')
+        if real_ip:
+            return real_ip
+        
+        return self.client_address[0] if self.client_address else "unknown"
+
+    def do_GET(self):
+        """Handle GET requests - health check and API info."""
+        logger.info("GET request received", path=self.path, ip=self.get_client_ip())
+        
+        parsed_url = urllib.parse.urlparse(self.path)
+        query = urllib.parse.parse_qs(parsed_url.query)
+        
+        # Health check endpoint
+        if 'health' in query:
+            try:
+                # Test database connection
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+                db_status = loop.run_until_complete(test_connection())
+                
+                self.send_json_response(200, {
+                    "status": "healthy",
+                    "timestamp": datetime.utcnow().isoformat() + "Z",
+                    "database": db_status,
+                    "environment": os.environ.get("ENVIRONMENT", "development")
+                })
+                
+            except Exception as e:
+                logger.error("Health check failed", error=str(e))
+                self.send_json_response(500, {
+                    "status": "unhealthy",
+                    "error": str(e),
+                    "timestamp": datetime.utcnow().isoformat() + "Z"
+                })
         else:
-            # Email confirmation required
-            logger.info(f"Signup successful, email confirmation required for: {request.email}")
-            raise HTTPException(
-                status_code=status.HTTP_202_ACCEPTED,
-                detail="Account created. Please check your email for confirmation."
-            )
+            # Default API info
+            self.send_json_response(200, {
+                "service": "LifeKB Authentication API",
+                "version": "1.0.0",
+                "endpoints": {
+                    "POST": {
+                        "login": "Login with email/password",
+                        "signup": "Register new user",
+                        "refresh": "Refresh access token"
+                    },
+                    "GET": {
+                        "health": "Health check"
+                    }
+                },
+                "documentation": "https://github.com/yourusername/lifekb-api"
+            })
+
+    def do_POST(self):
+        """Handle POST requests - authentication actions."""
+        try:
+            body = self.get_request_body()
+            action = body.get('action')
+            
+            if not action:
+                self.send_json_response(400, {
+                    'error': 'Missing action parameter',
+                    'required': 'action must be one of: login, signup, refresh'
+                })
+                return
+            
+            # Create event loop for async operations
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            
+            try:
+                if action == 'login':
+                    result = loop.run_until_complete(self.handle_login(body))
+                elif action == 'signup':
+                    result = loop.run_until_complete(self.handle_signup(body))
+                elif action == 'refresh':
+                    result = loop.run_until_complete(self.handle_refresh(body))
+                else:
+                    self.send_json_response(400, {
+                        'error': f'Invalid action: {action}',
+                        'valid_actions': ['login', 'signup', 'refresh']
+                    })
+                    return
+                
+                self.send_json_response(200, result)
+                
+            except AuthError as e:
+                self.send_json_response(401, {'error': str(e)})
+            except Exception as e:
+                self.send_json_response(500, {'error': f'Internal server error: {str(e)}'})
+            finally:
+                loop.close()
+                
+        except Exception as e:
+            self.send_json_response(500, {'error': f'Request processing error: {str(e)}'})
+
+    async def handle_login(self, body: dict) -> dict:
+        """Handle user login."""
+        email = body.get('email')
+        password = body.get('password')
         
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Signup error: {str(e)}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Registration service unavailable"
-        )
-
-
-@app.post("/refresh", response_model=AuthTokens)
-async def refresh_token(request: RefreshTokenRequest):
-    """
-    Refresh access token using refresh token
-    
-    Args:
-        request: Refresh token request
-    
-    Returns:
-        AuthTokens: New access token, refresh token, and metadata
+        if not email or not password:
+            raise AuthError('Email and password are required')
         
-    Raises:
-        HTTPException: 401 for invalid refresh token
-    """
-    try:
-        logger.info("Token refresh attempt")
+        ip_address = self.get_client_ip()
+        result = await authenticate_user(email, password, ip_address)
+        return {
+            'action': 'login',
+            'success': True,
+            'message': 'Login successful',
+            'user': result['user'],
+            'session': result['session']
+        }
+
+    async def handle_signup(self, body: dict) -> dict:
+        """Handle user registration."""
+        email = body.get('email')
+        password = body.get('password')
         
-        # Refresh tokens
-        refresh_result = await auth_manager.refresh_token(request.refresh_token)
+        if not email or not password:
+            raise AuthError('Email and password are required')
         
-        response = AuthTokens(
-            access_token=refresh_result["access_token"],
-            refresh_token=refresh_result["refresh_token"],
-            token_type=refresh_result["token_type"],
-            expires_in=refresh_result["expires_in"]
-        )
+        ip_address = self.get_client_ip()
+        result = await register_user(email, password, ip_address)
+        return {
+            'action': 'signup',
+            'success': True,
+            'message': 'Registration successful',
+            'user': result['user'],
+            'session': result['session'],
+            'note': 'Please check your email to confirm your account' if not result['user']['email_confirmed'] else None
+        }
+
+    async def handle_refresh(self, body: dict) -> dict:
+        """Handle token refresh."""
+        refresh_token_value = body.get('refresh_token')
         
-        logger.info("Token refresh successful")
-        return response
+        if not refresh_token_value:
+            raise AuthError('Refresh token is required')
         
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Token refresh error: {str(e)}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Token refresh service unavailable"
-        )
+        ip_address = self.get_client_ip()
+        result = await refresh_token(refresh_token_value)
+        return {
+            'action': 'refresh',
+            'success': True,
+            'message': 'Token refreshed successfully',
+            'session': result['session'],
+            'user': result['user']
+        }
 
-
-@app.get("/health")
-async def health_check():
-    """Health check endpoint"""
-    return {
-        "status": "healthy",
-        "service": "auth",
-        "version": "1.0.0"
-    }
-
-
-# Error handlers
-@app.exception_handler(ValidationError)
-async def validation_exception_handler(request: Request, exc: ValidationError):
-    """Handle Pydantic validation errors"""
-    return HTTPException(
-        status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-        detail=create_error_response(
-            "validation_error",
-            "Invalid request data",
-            {"errors": exc.errors()}
-        )
-    )
-
-
-@app.exception_handler(HTTPException)
-async def http_exception_handler(request: Request, exc: HTTPException):
-    """Handle HTTP exceptions"""
-    return HTTPException(
-        status_code=exc.status_code,
-        detail=create_error_response(
-            "http_error",
-            exc.detail,
-            {"status_code": exc.status_code}
-        )
-    )
-
-
-# Main handler for Vercel
-def handler(event, context):
-    """Vercel serverless function handler"""
-    import uvicorn
-    return uvicorn.run(app, host="0.0.0.0", port=8000) 
+    def do_OPTIONS(self):
+        """Handle CORS preflight requests."""
+        self.send_response(200)
+        self.send_header('Access-Control-Allow-Origin', '*')
+        self.send_header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')
+        self.send_header('Access-Control-Allow-Headers', 'Content-Type, Authorization')
+        self.end_headers() 

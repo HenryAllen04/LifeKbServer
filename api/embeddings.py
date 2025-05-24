@@ -1,311 +1,265 @@
-# LifeKB Backend Embeddings API
-# Purpose: Embedding management endpoints for status monitoring and regeneration
+# LifeKB Backend Embeddings API - Vercel Serverless Function
+# Purpose: Embedding generation and management operations
 
-from fastapi import FastAPI, HTTPException, status, Request, Depends, BackgroundTasks
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import ValidationError
-from uuid import UUID
-from typing import List, Dict, Any
-import os
+from http.server import BaseHTTPRequestHandler
 import json
-import logging
-import asyncio
-
-# Import our app modules
+import urllib.parse
+import os
 import sys
-sys.path.append('/var/task')
-from app.models import EmbeddingStatus, APIError
-from app.database import db_manager
-from app.embeddings import embedding_processor
-from app.auth import get_current_user_id
-from app.utils import (
-    create_error_response, create_success_response, setup_logging, 
-    get_client_ip, rate_limiter, TimingContext
-)
+import asyncio
+from datetime import datetime
+from uuid import UUID
 
-# Setup logging
-setup_logging(os.getenv("LOG_LEVEL", "INFO"))
-logger = logging.getLogger(__name__)
+# Add parent directory to path for imports
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-# Create FastAPI app
-app = FastAPI(
-    title="LifeKB Embeddings API",
-    description="Embedding management endpoints for the privacy-first journaling app",
-    version="1.0.0"
-)
+# Import from app modules
+try:
+    from app.embeddings import embeddings_manager, EmbeddingsError
+except ImportError:
+    embeddings_manager = None
+    EmbeddingsError = Exception
 
-# CORS middleware
-cors_origins = json.loads(os.getenv("CORS_ORIGINS", '["http://localhost:3000"]'))
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=cors_origins,
-    allow_credentials=True,
-    allow_methods=["GET", "POST", "PUT", "DELETE"],
-    allow_headers=["*"],
-)
+def serialize_datetime(obj):
+    """Convert datetime objects to ISO format strings for JSON serialization."""
+    if isinstance(obj, datetime):
+        return obj.isoformat()
+    elif hasattr(obj, 'isoformat'):  # Handle other datetime-like objects
+        return obj.isoformat()
+    return obj
 
-
-@app.middleware("http")
-async def rate_limit_middleware(request: Request, call_next):
-    """Rate limiting middleware"""
-    client_ip = get_client_ip(request)
-    
-    if not rate_limiter.is_allowed(client_ip):
-        raise HTTPException(
-            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-            detail="Rate limit exceeded. Please try again later."
-        )
-    
-    response = await call_next(request)
-    return response
-
-
-async def process_embeddings_background(user_id: UUID, entry_ids: List[str]):
-    """Process embeddings for entries in background"""
-    try:
-        logger.info(f"Starting background embedding processing for {len(entry_ids)} entries")
-        
-        for entry_id in entry_ids:
+def serialize_data(data):
+    """Recursively serialize datetime objects in data."""
+    if isinstance(data, dict):
+        result = {}
+        for key, value in data.items():
             try:
-                # Get entry data
-                entry_data = await db_manager.get_journal_entry(UUID(entry_id), user_id)
-                if not entry_data:
-                    logger.warning(f"Entry {entry_id} not found, skipping")
-                    continue
-                
-                # Generate embedding
-                with TimingContext(f"embedding_generation_{entry_id}") as timer:
-                    embedding = await embedding_processor.process_entry(entry_data["text"])
-                
-                # Update database
-                if embedding:
-                    await db_manager.update_embedding(UUID(entry_id), embedding, "completed")
-                    logger.info(f"Embedding generated for entry {entry_id} in {timer.duration_ms:.1f}ms")
-                else:
-                    await db_manager.update_embedding(UUID(entry_id), [], "failed")
-                    logger.error(f"Failed to generate embedding for entry {entry_id}")
-                
-                # Add delay between requests to respect rate limits
-                await asyncio.sleep(0.1)
-                
+                result[key] = serialize_data(value)
             except Exception as e:
-                logger.error(f"Error processing embedding for entry {entry_id}: {str(e)}")
-                try:
-                    await db_manager.update_embedding(UUID(entry_id), [], "failed")
-                except Exception:
-                    pass  # Ignore secondary failures
-        
-        logger.info(f"Background embedding processing completed for user {user_id}")
-        
-    except Exception as e:
-        logger.error(f"Background embedding processing failed for user {user_id}: {str(e)}")
+                # Convert problematic values to strings
+                result[key] = str(value)
+        return result
+    elif isinstance(data, list):
+        return [serialize_data(item) for item in data]
+    else:
+        return serialize_datetime(data)
 
+class AuthError(Exception):
+    """Custom exception for authentication errors."""
+    pass
 
-@app.get("/status", response_model=EmbeddingStatus)
-async def get_embedding_status(
-    current_user_id: UUID = Depends(get_current_user_id)
-):
-    """
-    Get embedding generation status for the authenticated user
+class ValidationError(Exception):
+    """Custom exception for validation errors."""
+    pass
+
+def extract_user_from_token(authorization_header):
+    """Extract user ID from JWT token in Authorization header."""
+    if not authorization_header:
+        raise AuthError("Authorization header required")
     
-    Args:
-        current_user_id: Authenticated user ID
+    if not authorization_header.startswith('Bearer '):
+        raise AuthError("Invalid authorization header format")
     
-    Returns:
-        EmbeddingStatus: Summary of embedding generation status
-        
-    Raises:
-        HTTPException: 500 for server errors
-    """
+    token = authorization_header[7:]  # Remove 'Bearer ' prefix
+    
+    # For development, we'll decode without verification
+    # In production, this should verify the JWT signature
+    import jwt
     try:
-        logger.info(f"Getting embedding status for user {current_user_id}")
+        if os.environ.get("ENVIRONMENT") == "development":
+            decoded = jwt.decode(token, options={"verify_signature": False})
+        else:
+            jwt_secret = os.environ.get("JWT_SECRET_KEY")
+            if not jwt_secret:
+                raise AuthError("JWT_SECRET_KEY not configured")
+            decoded = jwt.decode(token, jwt_secret, algorithms=["HS256"])
         
-        with TimingContext("embedding_status") as timer:
-            status_data = await db_manager.get_embedding_status(current_user_id)
+        user_id = decoded.get('sub')
+        if not user_id:
+            raise AuthError("Invalid token: missing user ID")
         
-        response = EmbeddingStatus(
-            total_entries=status_data["total_entries"],
-            pending_embeddings=status_data["pending_embeddings"],
-            completed_embeddings=status_data["completed_embeddings"],
-            failed_embeddings=status_data["failed_embeddings"]
-        )
+        return user_id
         
-        logger.info(f"Embedding status retrieved in {timer.duration_ms:.1f}ms")
-        return response
-        
+    except jwt.ExpiredSignatureError:
+        raise AuthError("Token has expired")
+    except jwt.InvalidTokenError:
+        raise AuthError("Invalid token")
     except Exception as e:
-        logger.error(f"Error getting embedding status: {str(e)}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Failed to get embedding status"
-        )
+        raise AuthError(f"Token validation error: {str(e)}")
 
-
-@app.post("/regenerate")
-async def regenerate_embeddings(
-    background_tasks: BackgroundTasks,
-    current_user_id: UUID = Depends(get_current_user_id)
-):
-    """
-    Regenerate embeddings for all user's journal entries
-    
-    Args:
-        background_tasks: Background task manager
-        current_user_id: Authenticated user ID
-    
-    Returns:
-        dict: Status message and task information
-        
-    Raises:
-        HTTPException: 500 for server errors
-    """
+async def process_embeddings(user_id: str, limit: int = 10):
+    """Process pending embeddings for a user."""
     try:
-        logger.info(f"Starting embedding regeneration for user {current_user_id}")
+        if not embeddings_manager:
+            raise Exception("Embeddings manager not available - check OPENAI_API_KEY")
         
-        # Get all entries for the user
-        with TimingContext("fetch_entries") as timer:
-            entries_result = await db_manager.get_journal_entries(
-                user_id=current_user_id,
-                page=1,
-                limit=1000  # Get a large number to cover most users
-            )
+        user_uuid = UUID(user_id)
+        result = await embeddings_manager.process_pending_embeddings(user_uuid, limit)
         
-        entry_ids = [entry["id"] for entry in entries_result["items"]]
-        total_entries = len(entry_ids)
+        return serialize_data(result)
         
-        logger.info(f"Found {total_entries} entries to process in {timer.duration_ms:.1f}ms")
-        
-        if total_entries == 0:
-            return create_success_response(
-                {"message": "No entries found to process"},
-                "No embeddings to regenerate"
-            )
-        
-        # Mark all entries as pending
-        for entry_id in entry_ids:
-            try:
-                await db_manager.update_embedding(UUID(entry_id), [], "pending")
-            except Exception as e:
-                logger.warning(f"Failed to mark entry {entry_id} as pending: {str(e)}")
-        
-        # Schedule background processing
-        background_tasks.add_task(process_embeddings_background, current_user_id, entry_ids)
-        
-        return create_success_response(
-            {
-                "total_entries": total_entries,
-                "status": "processing",
-                "message": f"Regenerating embeddings for {total_entries} entries"
-            },
-            "Embedding regeneration started"
-        )
-        
+    except EmbeddingsError as e:
+        raise Exception(f"Embedding processing error: {str(e)}")
     except Exception as e:
-        logger.error(f"Error starting embedding regeneration: {str(e)}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Failed to start embedding regeneration"
-        )
+        raise Exception(f"Processing failed: {str(e)}")
 
-
-@app.post("/process-pending")
-async def process_pending_embeddings(
-    background_tasks: BackgroundTasks,
-    current_user_id: UUID = Depends(get_current_user_id)
-):
-    """
-    Process pending embeddings for the authenticated user
-    
-    Args:
-        background_tasks: Background task manager
-        current_user_id: Authenticated user ID
-    
-    Returns:
-        dict: Status message and task information
-        
-    Raises:
-        HTTPException: 500 for server errors
-    """
+async def get_status(user_id: str):
+    """Get embedding status for a user."""
     try:
-        logger.info(f"Processing pending embeddings for user {current_user_id}")
+        if not embeddings_manager:
+            raise Exception("Embeddings manager not available - check OPENAI_API_KEY")
         
-        # Get entries without embeddings
-        with TimingContext("fetch_pending") as timer:
-            pending_entries = await db_manager.get_entries_without_embeddings(
-                user_id=current_user_id,
-                limit=50  # Process up to 50 entries at a time
-            )
+        user_uuid = UUID(user_id)
+        status = await embeddings_manager.get_embedding_status(user_uuid)
         
-        entry_ids = [entry["id"] for entry in pending_entries]
-        pending_count = len(entry_ids)
+        return serialize_data(status)
         
-        logger.info(f"Found {pending_count} pending entries in {timer.duration_ms:.1f}ms")
-        
-        if pending_count == 0:
-            return create_success_response(
-                {"message": "No pending embeddings found"},
-                "All embeddings are up to date"
-            )
-        
-        # Schedule background processing
-        background_tasks.add_task(process_embeddings_background, current_user_id, entry_ids)
-        
-        return create_success_response(
-            {
-                "pending_count": pending_count,
-                "status": "processing",
-                "message": f"Processing {pending_count} pending embeddings"
-            },
-            "Pending embeddings processing started"
-        )
-        
+    except EmbeddingsError as e:
+        raise Exception(f"Status error: {str(e)}")
     except Exception as e:
-        logger.error(f"Error processing pending embeddings: {str(e)}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Failed to process pending embeddings"
-        )
+        raise Exception(f"Status check failed: {str(e)}")
 
+async def generate_single_embedding(user_id: str, entry_id: str):
+    """Generate embedding for a specific entry."""
+    try:
+        if not embeddings_manager:
+            raise Exception("Embeddings manager not available - check OPENAI_API_KEY")
+        
+        # Get the entry text first (would need to implement this)
+        # For now, this is a placeholder
+        raise Exception("Single entry embedding generation not yet implemented")
+        
+    except EmbeddingsError as e:
+        raise Exception(f"Embedding generation error: {str(e)}")
+    except Exception as e:
+        raise Exception(f"Generation failed: {str(e)}")
 
-@app.get("/health")
-async def health_check():
-    """Health check endpoint"""
-    return {
-        "status": "healthy",
-        "service": "embeddings",
-        "version": "1.0.0"
-    }
+class handler(BaseHTTPRequestHandler):
+    def send_json_response(self, status_code: int, data: dict):
+        """Helper to send JSON responses with proper headers."""
+        self.send_response(status_code)
+        self.send_header('Content-Type', 'application/json')
+        self.send_header('Access-Control-Allow-Origin', '*')
+        self.send_header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')
+        self.send_header('Access-Control-Allow-Headers', 'Content-Type, Authorization')
+        self.end_headers()
+        self.wfile.write(json.dumps(data).encode('utf-8'))
 
+    def get_request_body(self) -> dict:
+        """Parse JSON request body."""
+        try:
+            content_length = int(self.headers.get('Content-Length', 0))
+            if content_length == 0:
+                return {}
+            
+            post_data = self.rfile.read(content_length)
+            return json.loads(post_data.decode('utf-8'))
+        except (json.JSONDecodeError, ValueError):
+            return {}
 
-# Error handlers
-@app.exception_handler(ValidationError)
-async def validation_exception_handler(request: Request, exc: ValidationError):
-    """Handle Pydantic validation errors"""
-    return HTTPException(
-        status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-        detail=create_error_response(
-            "validation_error",
-            "Invalid request data",
-            {"errors": exc.errors()}
-        )
-    )
+    def get_user_id(self) -> str:
+        """Extract and validate user ID from authorization header."""
+        auth_header = self.headers.get('Authorization')
+        return extract_user_from_token(auth_header)
 
+    def do_GET(self):
+        """Handle GET requests - status and info."""
+        try:
+            user_id = self.get_user_id()
+            
+            parsed_url = urllib.parse.urlparse(self.path)
+            query = urllib.parse.parse_qs(parsed_url.query)
+            
+            action = query.get('action', [None])[0]
+            
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            
+            if action == 'status':
+                # Get embedding status
+                result = loop.run_until_complete(get_status(user_id))
+                loop.close()
+                
+                self.send_json_response(200, {
+                    'success': True,
+                    'status': result
+                })
+            else:
+                # Default API info
+                loop.close()
+                self.send_json_response(200, {
+                    'message': 'LifeKB Embeddings API',
+                    'version': '1.0.0',
+                    'endpoints': {
+                        'GET': ['?action=status - Get embedding status'],
+                        'POST': [
+                            'action=process - Process pending embeddings',
+                            'action=generate - Generate specific embedding'
+                        ]
+                    },
+                    'status': 'running',
+                    'openai_configured': os.getenv("OPENAI_API_KEY") is not None
+                })
+            
+        except AuthError as e:
+            self.send_json_response(401, {'error': str(e)})
+        except Exception as e:
+            self.send_json_response(500, {'error': f'Internal server error: {str(e)}'})
 
-@app.exception_handler(HTTPException)
-async def http_exception_handler(request: Request, exc: HTTPException):
-    """Handle HTTP exceptions"""
-    return HTTPException(
-        status_code=exc.status_code,
-        detail=create_error_response(
-            "http_error",
-            exc.detail,
-            {"status_code": exc.status_code}
-        )
-    )
+    def do_POST(self):
+        """Handle POST requests - process embeddings."""
+        try:
+            user_id = self.get_user_id()
+            body = self.get_request_body()
+            
+            action = body.get('action', 'process')
+            
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            
+            if action == 'process':
+                # Process pending embeddings
+                limit = min(int(body.get('limit', 10)), 20)  # Max 20 at once
+                result = loop.run_until_complete(process_embeddings(user_id, limit))
+                loop.close()
+                
+                self.send_json_response(200, {
+                    'success': True,
+                    'action': 'process',
+                    'result': result
+                })
+                
+            elif action == 'generate':
+                # Generate specific embedding
+                entry_id = body.get('entry_id')
+                if not entry_id:
+                    raise ValidationError('entry_id is required for generate action')
+                
+                result = loop.run_until_complete(generate_single_embedding(user_id, entry_id))
+                loop.close()
+                
+                self.send_json_response(200, {
+                    'success': True,
+                    'action': 'generate',
+                    'entry_id': entry_id,
+                    'result': result
+                })
+                
+            else:
+                loop.close()
+                raise ValidationError(f'Invalid action: {action}. Valid actions: process, generate')
+            
+        except AuthError as e:
+            self.send_json_response(401, {'error': str(e)})
+        except ValidationError as e:
+            self.send_json_response(400, {'error': str(e)})
+        except Exception as e:
+            self.send_json_response(500, {'error': f'Internal server error: {str(e)}'})
 
-
-# Main handler for Vercel
-def handler(event, context):
-    """Vercel serverless function handler"""
-    import uvicorn
-    return uvicorn.run(app, host="0.0.0.0", port=8000) 
+    def do_OPTIONS(self):
+        """Handle CORS preflight requests."""
+        self.send_response(200)
+        self.send_header('Access-Control-Allow-Origin', '*')
+        self.send_header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')
+        self.send_header('Access-Control-Allow-Headers', 'Content-Type, Authorization')
+        self.end_headers() 

@@ -1,326 +1,270 @@
-# LifeKB Backend Search API
-# Purpose: Semantic search endpoint for AI-powered journal entry search
+# LifeKB Backend Search API - Vercel Serverless Function
+# Purpose: Semantic search operations using OpenAI embeddings
 
-from fastapi import FastAPI, HTTPException, status, Request, Depends, Query
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import ValidationError
-from uuid import UUID
-from typing import List, Optional
-import os
+from http.server import BaseHTTPRequestHandler
 import json
-import logging
-import time
-
-# Import our app modules
+import urllib.parse
+import os
 import sys
-sys.path.append('/var/task')
-from app.models import SearchRequest, SearchResponse, SearchResult, APIError
-from app.database import db_manager
-from app.embeddings import embedding_manager
-from app.auth import get_current_user_id
-from app.utils import (
-    create_error_response, create_success_response, setup_logging, 
-    get_client_ip, rate_limiter, TimingContext
-)
+import asyncio
+from datetime import datetime
+from uuid import UUID
 
-# Setup logging
-setup_logging(os.getenv("LOG_LEVEL", "INFO"))
-logger = logging.getLogger(__name__)
+# Add parent directory to path for imports
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-# Create FastAPI app
-app = FastAPI(
-    title="LifeKB Search API",
-    description="Semantic search endpoints for the privacy-first journaling app",
-    version="1.0.0"
-)
+# Import from app modules
+try:
+    from app.embeddings import embeddings_manager, EmbeddingsError
+except ImportError:
+    embeddings_manager = None
+    EmbeddingsError = Exception
 
-# CORS middleware
-cors_origins = json.loads(os.getenv("CORS_ORIGINS", '["http://localhost:3000"]'))
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=cors_origins,
-    allow_credentials=True,
-    allow_methods=["GET", "POST", "PUT", "DELETE"],
-    allow_headers=["*"],
-)
+def serialize_datetime(obj):
+    """Convert datetime objects to ISO format strings for JSON serialization."""
+    if isinstance(obj, datetime):
+        return obj.isoformat()
+    elif hasattr(obj, 'isoformat'):  # Handle other datetime-like objects
+        return obj.isoformat()
+    return obj
 
+def serialize_data(data):
+    """Recursively serialize datetime objects in data."""
+    if isinstance(data, dict):
+        result = {}
+        for key, value in data.items():
+            try:
+                result[key] = serialize_data(value)
+            except Exception as e:
+                # Convert problematic values to strings
+                result[key] = str(value)
+        return result
+    elif isinstance(data, list):
+        return [serialize_data(item) for item in data]
+    else:
+        return serialize_datetime(data)
 
-@app.middleware("http")
-async def rate_limit_middleware(request: Request, call_next):
-    """Rate limiting middleware"""
-    client_ip = get_client_ip(request)
+class AuthError(Exception):
+    """Custom exception for authentication errors."""
+    pass
+
+class ValidationError(Exception):
+    """Custom exception for validation errors."""
+    pass
+
+def extract_user_from_token(authorization_header):
+    """Extract user ID from JWT token in Authorization header."""
+    if not authorization_header:
+        raise AuthError("Authorization header required")
     
-    if not rate_limiter.is_allowed(client_ip):
-        raise HTTPException(
-            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-            detail="Rate limit exceeded. Please try again later."
-        )
+    if not authorization_header.startswith('Bearer '):
+        raise AuthError("Invalid authorization header format")
     
-    response = await call_next(request)
-    return response
-
-
-@app.post("/", response_model=SearchResponse)
-async def semantic_search(
-    search_request: SearchRequest,
-    current_user_id: UUID = Depends(get_current_user_id)
-):
-    """
-    Perform semantic search across user's journal entries
+    token = authorization_header[7:]  # Remove 'Bearer ' prefix
     
-    Args:
-        search_request: Search query and parameters
-        current_user_id: Authenticated user ID
-    
-    Returns:
-        SearchResponse: Search results with similarity scores and metadata
-        
-    Raises:
-        HTTPException: 400 for validation errors, 500 for server errors
-    """
-    search_start_time = time.time()
-    
+    # For development, we'll decode without verification
+    # In production, this should verify the JWT signature
+    import jwt
     try:
-        logger.info(f"Semantic search for user {current_user_id}: '{search_request.query}'")
+        if os.environ.get("ENVIRONMENT") == "development":
+            decoded = jwt.decode(token, options={"verify_signature": False})
+        else:
+            jwt_secret = os.environ.get("JWT_SECRET_KEY")
+            if not jwt_secret:
+                raise AuthError("JWT_SECRET_KEY not configured")
+            decoded = jwt.decode(token, jwt_secret, algorithms=["HS256"])
         
-        # Generate embedding for search query
-        with TimingContext("query_embedding") as embedding_timer:
-            query_embedding = await embedding_manager.search_embedding(search_request.query)
+        user_id = decoded.get('sub')
+        if not user_id:
+            raise AuthError("Invalid token: missing user ID")
         
-        logger.info(f"Query embedding generated in {embedding_timer.duration_ms:.1f}ms")
+        return user_id
         
-        # Perform semantic search in database
-        with TimingContext("database_search") as search_timer:
-            search_results = await db_manager.search_entries(
-                user_id=current_user_id,
-                query_embedding=query_embedding,
-                similarity_threshold=search_request.similarity_threshold,
-                limit=search_request.limit
-            )
-        
-        logger.info(f"Database search completed in {search_timer.duration_ms:.1f}ms")
-        
-        # Convert to response models
-        results = []
-        for result in search_results:
-            search_result = SearchResult(
-                id=UUID(result["id"]),
-                text=result["text"],
-                created_at=result["created_at"],
-                similarity=result["similarity"]
-            )
-            results.append(search_result)
-        
-        # Calculate total search time
-        search_time_ms = (time.time() - search_start_time) * 1000
-        
-        response = SearchResponse(
-            results=results,
-            total_count=len(results),
-            query=search_request.query,
-            search_time_ms=search_time_ms
-        )
-        
-        logger.info(f"Search completed: {len(results)} results in {search_time_ms:.1f}ms")
-        return response
-        
-    except HTTPException:
-        raise
+    except jwt.ExpiredSignatureError:
+        raise AuthError("Token has expired")
+    except jwt.InvalidTokenError:
+        raise AuthError("Invalid token")
     except Exception as e:
-        logger.error(f"Error performing semantic search: {str(e)}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Search service unavailable"
-        )
+        raise AuthError(f"Token validation error: {str(e)}")
 
-
-@app.get("/suggestions")
-async def get_search_suggestions(
-    query: str = Query(..., min_length=1, max_length=100, description="Partial search query"),
-    limit: int = Query(5, ge=1, le=10, description="Number of suggestions"),
-    current_user_id: UUID = Depends(get_current_user_id)
-):
-    """
-    Get search suggestions based on user's journal content
-    
-    Args:
-        query: Partial search query
-        limit: Maximum number of suggestions
-        current_user_id: Authenticated user ID
-    
-    Returns:
-        dict: List of search suggestions
-        
-    Raises:
-        HTTPException: 500 for server errors
-    """
+async def perform_semantic_search(user_id: str, query: str, limit: int = 10, similarity_threshold: float = 0.1):
+    """Perform semantic search on user's journal entries."""
     try:
-        logger.info(f"Search suggestions for user {current_user_id}: '{query}'")
+        if not embeddings_manager:
+            raise Exception("Embeddings manager not available")
         
-        # For now, return a simple keyword-based suggestion
-        # In a more advanced implementation, this could use:
-        # - Common keywords from user's entries
-        # - Recent search history
-        # - AI-generated query suggestions
-        
-        suggestions = []
-        
-        # Simple keyword-based suggestions (this is a placeholder)
-        query_lower = query.lower()
-        common_topics = [
-            "feelings", "work", "family", "goals", "thoughts", "dreams",
-            "memories", "plans", "emotions", "relationships", "creativity",
-            "challenges", "achievements", "reflections", "insights"
-        ]
-        
-        for topic in common_topics:
-            if query_lower in topic or topic.startswith(query_lower):
-                suggestions.append(topic)
-                if len(suggestions) >= limit:
-                    break
-        
-        # If no topic matches, suggest completing the query
-        if not suggestions and len(query) > 2:
-            suggestions.append(query + " feelings")
-            suggestions.append(query + " thoughts")
-            suggestions.append(query + " experience")
-        
-        return create_success_response({
-            "suggestions": suggestions[:limit],
-            "query": query
-        })
-        
-    except Exception as e:
-        logger.error(f"Error getting search suggestions: {str(e)}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Suggestions service unavailable"
+        user_uuid = UUID(user_id)
+        results = await embeddings_manager.search_similar_entries(
+            user_uuid, 
+            query, 
+            limit, 
+            similarity_threshold
         )
-
-
-@app.get("/similar/{entry_id}")
-async def find_similar_entries(
-    entry_id: UUID,
-    limit: int = Query(5, ge=1, le=20, description="Number of similar entries"),
-    similarity_threshold: float = Query(0.3, ge=0.0, le=1.0, description="Minimum similarity score"),
-    current_user_id: UUID = Depends(get_current_user_id)
-):
-    """
-    Find entries similar to a specific entry
-    
-    Args:
-        entry_id: Reference entry UUID
-        limit: Maximum number of similar entries
-        similarity_threshold: Minimum similarity score
-        current_user_id: Authenticated user ID
-    
-    Returns:
-        dict: List of similar entries
         
-    Raises:
-        HTTPException: 404 if entry not found, 500 for server errors
-    """
+        return serialize_data(results)
+        
+    except EmbeddingsError as e:
+        raise Exception(f"Search error: {str(e)}")
+    except Exception as e:
+        raise Exception(f"Search failed: {str(e)}")
+
+async def process_pending_embeddings(user_id: str, limit: int = 5):
+    """Process pending embeddings for a user."""
     try:
-        logger.info(f"Finding similar entries to {entry_id} for user {current_user_id}")
+        if not embeddings_manager:
+            raise Exception("Embeddings manager not available")
         
-        # Get the reference entry
-        reference_entry = await db_manager.get_journal_entry(entry_id, current_user_id)
-        if not reference_entry:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail="Reference entry not found"
-            )
+        user_uuid = UUID(user_id)
+        result = await embeddings_manager.process_pending_embeddings(user_uuid, limit)
         
-        # Check if entry has embedding
-        if not reference_entry.get("embedding"):
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Reference entry does not have embedding generated yet"
-            )
+        return serialize_data(result)
         
-        # Search for similar entries using the reference entry's embedding
-        with TimingContext("similarity_search") as timer:
-            similar_results = await db_manager.search_entries(
-                user_id=current_user_id,
-                query_embedding=reference_entry["embedding"],
-                similarity_threshold=similarity_threshold,
-                limit=limit + 1  # +1 to exclude the reference entry itself
-            )
-        
-        # Filter out the reference entry itself
-        filtered_results = [
-            result for result in similar_results 
-            if result["id"] != str(entry_id)
-        ][:limit]
-        
-        # Convert to response format
-        similar_entries = []
-        for result in filtered_results:
-            similar_entry = SearchResult(
-                id=UUID(result["id"]),
-                text=result["text"],
-                created_at=result["created_at"],
-                similarity=result["similarity"]
-            )
-            similar_entries.append(similar_entry)
-        
-        logger.info(f"Found {len(similar_entries)} similar entries in {timer.duration_ms:.1f}ms")
-        
-        return create_success_response({
-            "similar_entries": [entry.dict() for entry in similar_entries],
-            "reference_entry_id": str(entry_id),
-            "count": len(similar_entries)
-        })
-        
-    except HTTPException:
-        raise
+    except EmbeddingsError as e:
+        raise Exception(f"Embedding processing error: {str(e)}")
     except Exception as e:
-        logger.error(f"Error finding similar entries: {str(e)}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Similar entries service unavailable"
-        )
+        raise Exception(f"Processing failed: {str(e)}")
 
+async def get_embedding_status(user_id: str):
+    """Get embedding generation status for a user."""
+    try:
+        if not embeddings_manager:
+            raise Exception("Embeddings manager not available")
+        
+        user_uuid = UUID(user_id)
+        status = await embeddings_manager.get_embedding_status(user_uuid)
+        
+        return serialize_data(status)
+        
+    except EmbeddingsError as e:
+        raise Exception(f"Status error: {str(e)}")
+    except Exception as e:
+        raise Exception(f"Status check failed: {str(e)}")
 
-@app.get("/health")
-async def health_check():
-    """Health check endpoint"""
-    return {
-        "status": "healthy",
-        "service": "search",
-        "version": "1.0.0"
-    }
+class handler(BaseHTTPRequestHandler):
+    def send_json_response(self, status_code: int, data: dict):
+        """Helper to send JSON responses with proper headers."""
+        self.send_response(status_code)
+        self.send_header('Content-Type', 'application/json')
+        self.send_header('Access-Control-Allow-Origin', '*')
+        self.send_header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')
+        self.send_header('Access-Control-Allow-Headers', 'Content-Type, Authorization')
+        self.end_headers()
+        self.wfile.write(json.dumps(data).encode('utf-8'))
 
+    def get_request_body(self) -> dict:
+        """Parse JSON request body."""
+        try:
+            content_length = int(self.headers.get('Content-Length', 0))
+            if content_length == 0:
+                return {}
+            
+            post_data = self.rfile.read(content_length)
+            return json.loads(post_data.decode('utf-8'))
+        except (json.JSONDecodeError, ValueError):
+            return {}
 
-# Error handlers
-@app.exception_handler(ValidationError)
-async def validation_exception_handler(request: Request, exc: ValidationError):
-    """Handle Pydantic validation errors"""
-    return HTTPException(
-        status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-        detail=create_error_response(
-            "validation_error",
-            "Invalid request data",
-            {"errors": exc.errors()}
-        )
-    )
+    def get_user_id(self) -> str:
+        """Extract and validate user ID from authorization header."""
+        auth_header = self.headers.get('Authorization')
+        return extract_user_from_token(auth_header)
 
+    def do_GET(self):
+        """Handle GET requests - embedding status."""
+        try:
+            user_id = self.get_user_id()
+            
+            parsed_url = urllib.parse.urlparse(self.path)
+            query = urllib.parse.parse_qs(parsed_url.query)
+            
+            # Check for specific actions
+            action = query.get('action', [None])[0]
+            
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            
+            if action == 'status':
+                # Get embedding status
+                result = loop.run_until_complete(get_embedding_status(user_id))
+                loop.close()
+                
+                self.send_json_response(200, {
+                    'success': True,
+                    'status': result
+                })
+            elif action == 'process':
+                # Process pending embeddings
+                limit = int(query.get('limit', [5])[0])
+                result = loop.run_until_complete(process_pending_embeddings(user_id, limit))
+                loop.close()
+                
+                self.send_json_response(200, {
+                    'success': True,
+                    'processing_result': result
+                })
+            else:
+                # Default API info
+                loop.close()
+                self.send_json_response(200, {
+                    'message': 'LifeKB Search API',
+                    'version': '1.0.0',
+                    'endpoints': {
+                        'GET': [
+                            '?action=status - Get embedding status',
+                            '?action=process - Process pending embeddings'
+                        ],
+                        'POST': ['Search entries with semantic similarity']
+                    },
+                    'status': 'running'
+                })
+            
+        except AuthError as e:
+            self.send_json_response(401, {'error': str(e)})
+        except Exception as e:
+            self.send_json_response(500, {'error': f'Internal server error: {str(e)}'})
 
-@app.exception_handler(HTTPException)
-async def http_exception_handler(request: Request, exc: HTTPException):
-    """Handle HTTP exceptions"""
-    return HTTPException(
-        status_code=exc.status_code,
-        detail=create_error_response(
-            "http_error",
-            exc.detail,
-            {"status_code": exc.status_code}
-        )
-    )
+    def do_POST(self):
+        """Handle POST requests - semantic search."""
+        try:
+            user_id = self.get_user_id()
+            body = self.get_request_body()
+            
+            query = body.get('query', '').strip()
+            if not query:
+                raise ValidationError('Search query is required')
+            
+            limit = min(int(body.get('limit', 10)), 50)  # Max 50 results
+            similarity_threshold = float(body.get('similarity_threshold', 0.1))
+            
+            # Validate similarity threshold
+            if not 0.0 <= similarity_threshold <= 1.0:
+                raise ValidationError('Similarity threshold must be between 0.0 and 1.0')
+            
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            results = loop.run_until_complete(
+                perform_semantic_search(user_id, query, limit, similarity_threshold)
+            )
+            loop.close()
+            
+            self.send_json_response(200, {
+                'success': True,
+                'query': query,
+                'results': results,
+                'count': len(results),
+                'similarity_threshold': similarity_threshold
+            })
+            
+        except AuthError as e:
+            self.send_json_response(401, {'error': str(e)})
+        except ValidationError as e:
+            self.send_json_response(400, {'error': str(e)})
+        except Exception as e:
+            self.send_json_response(500, {'error': f'Internal server error: {str(e)}'})
 
-
-# Main handler for Vercel
-def handler(event, context):
-    """Vercel serverless function handler"""
-    import uvicorn
-    return uvicorn.run(app, host="0.0.0.0", port=8000) 
+    def do_OPTIONS(self):
+        """Handle CORS preflight requests."""
+        self.send_response(200)
+        self.send_header('Access-Control-Allow-Origin', '*')
+        self.send_header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')
+        self.send_header('Access-Control-Allow-Headers', 'Content-Type, Authorization')
+        self.end_headers() 

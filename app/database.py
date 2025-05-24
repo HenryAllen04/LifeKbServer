@@ -262,4 +262,47 @@ class DatabaseManager:
 
 
 # Global database manager instance
-db_manager = DatabaseManager() 
+db_manager = DatabaseManager()
+
+# Initialize Supabase client
+def get_supabase_client() -> Client:
+    """Initialize and return Supabase client with environment variables."""
+    url = os.environ.get("SUPABASE_URL")
+    key = os.environ.get("SUPABASE_SERVICE_KEY")
+    
+    if not url or not key:
+        raise ValueError("SUPABASE_URL and SUPABASE_SERVICE_KEY must be set in environment")
+    
+    return create_client(url, key)
+
+# Global client instance
+supabase: Client = get_supabase_client()
+
+class DatabaseError(Exception):
+    """Custom exception for database operations."""
+    pass
+
+def handle_supabase_error(response) -> None:
+    """Handle Supabase API errors and raise appropriate exceptions."""
+    if hasattr(response, 'error') and response.error:
+        error_msg = response.error.message if hasattr(response.error, 'message') else str(response.error)
+        raise DatabaseError(f"Database error: {error_msg}")
+
+async def test_connection() -> Dict[str, Any]:
+    """Test database connection and return basic info."""
+    try:
+        # Simple query to test connection
+        response = supabase.table('journal_entries').select('count', count='exact').execute()
+        handle_supabase_error(response)
+        
+        return {
+            "status": "connected",
+            "url": os.environ.get("SUPABASE_URL"),
+            "table_exists": True
+        }
+    except Exception as e:
+        return {
+            "status": "error",
+            "error": str(e),
+            "url": os.environ.get("SUPABASE_URL")
+        } 
