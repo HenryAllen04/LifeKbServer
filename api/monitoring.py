@@ -1,275 +1,354 @@
-# Purpose: Monitoring API endpoint for performance metrics, health checks, and system status
-# Provides real-time monitoring data for the LifeKB backend system
+# LifeKB Backend Monitoring API - Vercel Serverless Function
+# Purpose: System health checks, performance metrics, and API status monitoring
 
+from http.server import BaseHTTPRequestHandler
 import json
+import urllib.parse
+import urllib.request
+import urllib.error
 import os
+import time
 from datetime import datetime
-from typing import Dict, Any
+from typing import Dict, Optional, Any
+import hashlib
+import hmac
+import base64
 
-from app.monitoring import performance_monitor, create_logger, _metrics_store, _rate_limit_store
-from app.database import get_supabase_client
-from app.auth import get_user_from_token
+# === EMBEDDED JWT HANDLER ===
 
-logger = create_logger("monitoring_api")
+class JWTHandler:
+    @staticmethod
+    def decode_jwt(token: str, secret: str) -> tuple[bool, Optional[Dict], Optional[str]]:
+        try:
+            parts = token.split('.')
+            if len(parts) != 3:
+                return False, None, "Invalid token format"
+            
+            header_encoded, payload_encoded, signature_encoded = parts
+            
+            message = f"{header_encoded}.{payload_encoded}"
+            expected_signature = hmac.new(
+                secret.encode(),
+                message.encode(),
+                hashlib.sha256
+            ).digest()
+            
+            signature_padded = signature_encoded + '=' * (4 - len(signature_encoded) % 4)
+            received_signature = base64.urlsafe_b64decode(signature_padded)
+            
+            if not hmac.compare_digest(expected_signature, received_signature):
+                return False, None, "Invalid signature"
+            
+            payload_padded = payload_encoded + '=' * (4 - len(payload_encoded) % 4)
+            payload = json.loads(base64.urlsafe_b64decode(payload_padded).decode())
+            
+            if "exp" in payload and payload["exp"] < time.time():
+                return False, None, "Token expired"
+            
+            return True, payload, None
+            
+        except Exception as e:
+            return False, None, f"Token decode error: {str(e)}"
 
-def handler(request):
-    """Handle monitoring endpoint requests"""
+# === SUPABASE REQUEST FUNCTION ===
+
+def supabase_request(method: str, endpoint: str, data: Optional[Dict] = None, params: Optional[Dict] = None):
+    """Make direct HTTP requests to Supabase REST API"""
+    supabase_url = os.environ.get("SUPABASE_URL")
+    supabase_key = os.environ.get("SUPABASE_SERVICE_KEY")
     
-    # CORS headers
+    if not supabase_url or not supabase_key:
+        raise Exception("SUPABASE_URL and SUPABASE_SERVICE_KEY must be configured")
+    
+    url = f"{supabase_url}/rest/v1/{endpoint}"
+    if params:
+        query_string = urllib.parse.urlencode(params)
+        url += f"?{query_string}"
+    
     headers = {
-        'Access-Control-Allow-Origin': '*',
-        'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
-        'Access-Control-Allow-Headers': 'Content-Type, Authorization',
-        'Content-Type': 'application/json'
+        "apikey": supabase_key,
+        "Authorization": f"Bearer {supabase_key}",
+        "Content-Type": "application/json"
     }
     
-    if request.method == "OPTIONS":
-        return {
-            'statusCode': 200,
-            'headers': headers,
-            'body': ''
-        }
+    request_data = None
+    if data:
+        request_data = json.dumps(data).encode('utf-8')
+    
+    req = urllib.request.Request(url, data=request_data, headers=headers, method=method)
     
     try:
-        if request.method == "GET":
-            return handle_get_monitoring(request, headers)
-        else:
-            return {
-                'statusCode': 405,
-                'headers': headers,
-                'body': json.dumps({"error": "Method not allowed"})
-            }
+        with urllib.request.urlopen(req) as response:
+            if response.status not in [200, 201, 204]:
+                error_text = response.read().decode('utf-8')
+                raise Exception(f"Supabase error: {response.status} - {error_text}")
             
+            if response.status == 204:
+                return {}
+            
+            return json.loads(response.read().decode('utf-8'))
+            
+    except urllib.error.HTTPError as e:
+        error_text = e.read().decode('utf-8') if e.fp else str(e)
+        raise Exception(f"Supabase error: {e.code} - {error_text}")
+
+# === MONITORING FUNCTIONS ===
+
+def get_system_health() -> Dict[str, Any]:
+    """Get comprehensive system health status"""
+    health_status = {
+        "status": "healthy",
+        "timestamp": datetime.utcnow().isoformat() + "Z",
+        "version": "1.0.0",
+        "environment": os.getenv("VERCEL_ENV", "development"),
+        "components": {}
+    }
+    
+    # Test database connection
+    try:
+        start_time = time.time()
+        # Simple query to test connection
+        result = supabase_request("GET", "journal_entries", params={"limit": "1"})
+        db_response_time = round((time.time() - start_time) * 1000, 2)
+        
+        health_status["components"]["database"] = {
+            "status": "healthy",
+            "response_time_ms": db_response_time,
+            "connection": "successful"
+        }
     except Exception as e:
-        logger.error("Monitoring endpoint error", error=str(e), error_type=type(e).__name__)
+        health_status["status"] = "unhealthy"
+        health_status["components"]["database"] = {
+            "status": "unhealthy",
+            "error": str(e),
+            "connection": "failed"
+        }
+    
+    # Test OpenAI API availability (just check if key is configured)
+    openai_key = os.environ.get("OPENAI_API_KEY")
+    health_status["components"]["openai"] = {
+        "status": "configured" if openai_key else "not_configured",
+        "key_present": bool(openai_key)
+    }
+    
+    # Test environment variables
+    required_env_vars = ["SUPABASE_URL", "SUPABASE_SERVICE_KEY", "JWT_SECRET_KEY"]
+    missing_vars = [var for var in required_env_vars if not os.environ.get(var)]
+    
+    health_status["components"]["environment"] = {
+        "status": "healthy" if not missing_vars else "unhealthy",
+        "missing_variables": missing_vars,
+        "configured_variables": len(required_env_vars) - len(missing_vars)
+    }
+    
+    return health_status
+
+def get_system_metrics() -> Dict[str, Any]:
+    """Get basic system metrics and statistics"""
+    try:
+        # Get total users count
+        users_result = supabase_request("GET", "journal_entries", params={
+            "select": "user_id",
+            "limit": "1000"  # Reasonable limit for counting
+        })
+        
+        unique_users = len(set(entry["user_id"] for entry in users_result)) if users_result else 0
+        
+        # Get total entries count
+        entries_count = len(users_result) if users_result else 0
+        
+        # Get embedding statistics
+        embeddings_result = supabase_request("GET", "journal_entries", params={
+            "select": "embedding_status",
+            "limit": "1000"
+        })
+        
+        embedding_stats = {"pending": 0, "completed": 0, "failed": 0}
+        if embeddings_result:
+            for entry in embeddings_result:
+                status = entry.get("embedding_status", "pending")
+                embedding_stats[status] = embedding_stats.get(status, 0) + 1
+        
+        completion_rate = 0
+        if entries_count > 0:
+            completion_rate = round((embedding_stats["completed"] / entries_count) * 100, 1)
+        
         return {
-            'statusCode': 500,
-            'headers': headers,
-            'body': json.dumps({
-                "error": "Internal server error",
-                "message": str(e)
-            })
+            "timestamp": datetime.utcnow().isoformat() + "Z",
+            "database_metrics": {
+                "total_users": unique_users,
+                "total_entries": entries_count,
+                "entries_per_user": round(entries_count / unique_users, 1) if unique_users > 0 else 0
+            },
+            "embedding_metrics": {
+                "total_embeddings": embedding_stats["completed"],
+                "pending_embeddings": embedding_stats["pending"],
+                "failed_embeddings": embedding_stats["failed"],
+                "completion_rate_percent": completion_rate
+            },
+            "system_info": {
+                "python_version": "3.9+",
+                "deployment_platform": "Vercel Serverless",
+                "database_provider": "Supabase PostgreSQL"
+            }
+        }
+        
+    except Exception as e:
+        return {
+            "error": f"Failed to retrieve metrics: {str(e)}",
+            "timestamp": datetime.utcnow().isoformat() + "Z"
         }
 
-def handle_get_monitoring(request, headers: Dict[str, str]):
-    """Handle GET requests for monitoring data"""
+def test_api_endpoints() -> Dict[str, Any]:
+    """Test availability of other API endpoints"""
+    base_url = os.environ.get("VERCEL_URL", "localhost:3000")
+    if not base_url.startswith("http"):
+        base_url = f"https://{base_url}"
     
-    # Parse query parameters
-    query_params = request.args if hasattr(request, 'args') else {}
+    endpoints = {
+        "auth": f"{base_url}/api/auth_working",
+        "entries": f"{base_url}/api/entries", 
+        "search": f"{base_url}/api/search",
+        "embeddings": f"{base_url}/api/embeddings"
+    }
     
-    # Check if authentication is required (for detailed metrics)
-    auth_header = request.headers.get('Authorization', '') if hasattr(request, 'headers') else ''
+    results = {}
     
-    # Public health check (no auth required)
-    if query_params.get('type') == 'health':
-        health_data = get_health_check()
-        return {
-            'statusCode': 200,
-            'headers': headers,
-            'body': json.dumps(health_data)
-        }
-    
-    # Basic metrics (no auth required)
-    if query_params.get('type') == 'basic':
-        basic_metrics = get_basic_metrics()
-        return {
-            'statusCode': 200,
-            'headers': headers,
-            'body': json.dumps(basic_metrics)
-        }
-    
-    # Detailed metrics (authentication required)
-    if auth_header:
+    for name, url in endpoints.items():
         try:
-            # Verify admin or user token
-            user_data = get_user_from_token(auth_header.replace('Bearer ', ''))
-            if user_data:
-                detailed_metrics = get_detailed_metrics(query_params)
-                return {
-                    'statusCode': 200,
-                    'headers': headers,
-                    'body': json.dumps(detailed_metrics)
+            start_time = time.time()
+            req = urllib.request.Request(url, method='GET')
+            req.add_header('User-Agent', 'LifeKB-Monitor/1.0')
+            
+            with urllib.request.urlopen(req, timeout=5) as response:
+                response_time = round((time.time() - start_time) * 1000, 2)
+                results[name] = {
+                    "status": "healthy",
+                    "response_code": response.status,
+                    "response_time_ms": response_time
                 }
         except Exception as e:
-            logger.warn("Authentication failed for monitoring access", error=str(e))
-    
-    # Default: return public monitoring summary
-    summary = get_public_monitoring_summary()
-    return {
-        'statusCode': 200,
-        'headers': headers,
-        'body': json.dumps(summary)
-    }
-
-def get_health_check() -> Dict[str, Any]:
-    """Get basic health check information"""
-    logger.info("Health check requested")
-    
-    try:
-        # Test database connection
-        supabase = get_supabase_client()
-        db_status = test_database_connection(supabase)
-        
-        health_status = {
-            "status": "healthy" if db_status["connected"] else "unhealthy",
-            "timestamp": datetime.utcnow().isoformat() + "Z",
-            "version": "1.0.0",
-            "environment": os.getenv("ENVIRONMENT", "development"),
-            "components": {
-                "database": db_status,
-                "api": {
-                    "status": "online",
-                    "uptime": "unknown"  # Could track since start
-                }
+            results[name] = {
+                "status": "unhealthy",
+                "error": str(e)
             }
-        }
-        
-        return health_status
-        
-    except Exception as e:
-        logger.error("Health check failed", error=str(e))
-        return {
-            "status": "unhealthy",
-            "timestamp": datetime.utcnow().isoformat() + "Z",
-            "error": str(e)
-        }
-
-def get_basic_metrics() -> Dict[str, Any]:
-    """Get basic performance metrics (public)"""
-    logger.info("Basic metrics requested")
     
-    try:
-        metrics_summary = performance_monitor.get_metrics_summary(hours=1)
-        
-        # Aggregate basic stats
-        total_requests = sum(m.get("total_requests", 0) for m in metrics_summary.values())
-        avg_response_time = 0
-        success_rate = 0
-        
-        if metrics_summary:
-            avg_response_time = sum(m.get("avg_duration_ms", 0) for m in metrics_summary.values()) / len(metrics_summary)
-            total_success = sum(m.get("success_requests", 0) for m in metrics_summary.values())
-            success_rate = (total_success / total_requests * 100) if total_requests > 0 else 100
-        
-        return {
-            "timestamp": datetime.utcnow().isoformat() + "Z",
-            "period": "last_hour",
-            "summary": {
-                "total_requests": total_requests,
-                "average_response_time_ms": round(avg_response_time, 2),
-                "success_rate_percent": round(success_rate, 2),
-                "active_endpoints": len(metrics_summary)
-            }
-        }
-        
-    except Exception as e:
-        logger.error("Failed to get basic metrics", error=str(e))
-        return {
-            "error": "Failed to retrieve metrics",
-            "timestamp": datetime.utcnow().isoformat() + "Z"
-        }
+    return results
 
-def get_detailed_metrics(query_params: Dict[str, str]) -> Dict[str, Any]:
-    """Get detailed performance metrics (requires authentication)"""
-    logger.info("Detailed metrics requested", query_params=query_params)
+# === MAIN REQUEST HANDLER ===
+
+class handler(BaseHTTPRequestHandler):
+    def __init__(self, *args, **kwargs):
+        self.start_time = time.time()
+        super().__init__(*args, **kwargs)
     
-    try:
-        hours = int(query_params.get('hours', 24))
+    def _send_json_response(self, status_code: int, data: Dict):
+        self.send_response(status_code)
+        self.send_header('Content-Type', 'application/json')
+        self.send_header('Access-Control-Allow-Origin', '*')
+        self.send_header('Access-Control-Allow-Methods', 'GET, OPTIONS')
+        self.send_header('Access-Control-Allow-Headers', 'Content-Type, Authorization')
+        self.end_headers()
+        self.wfile.write(json.dumps(data).encode('utf-8'))
+    
+    def _send_error_response(self, status_code: int, error_message: str):
+        self._send_json_response(status_code, {
+            "error": error_message,
+            "timestamp": datetime.now().isoformat(),
+            "status": "error"
+        })
+    
+    def _verify_auth(self) -> Optional[str]:
+        """Verify JWT token and return user_id (optional for monitoring)"""
+        auth_header = self.headers.get('Authorization', '')
         
-        # Get performance metrics
-        metrics_summary = performance_monitor.get_metrics_summary(hours=hours)
+        if not auth_header.startswith('Bearer '):
+            return None
         
-        # Get rate limiting stats
-        rate_limit_stats = get_rate_limit_stats()
+        token = auth_header[7:]
+        jwt_secret = os.environ.get("JWT_SECRET_KEY", "fallback-secret-key")
+        valid, payload, _ = JWTHandler.decode_jwt(token, jwt_secret)
         
-        # System stats
-        system_stats = get_system_stats()
+        if not valid:
+            return None
         
-        return {
-            "timestamp": datetime.utcnow().isoformat() + "Z",
-            "period_hours": hours,
-            "performance_metrics": metrics_summary,
-            "rate_limiting": rate_limit_stats,
-            "system": system_stats,
-            "endpoint_details": [
-                {
-                    "endpoint": endpoint,
-                    "metrics": metrics
-                }
-                for endpoint, metrics in metrics_summary.items()
-            ]
-        }
-        
-    except Exception as e:
-        logger.error("Failed to get detailed metrics", error=str(e))
-        return {
-            "error": "Failed to retrieve detailed metrics",
-            "timestamp": datetime.utcnow().isoformat() + "Z"
-        }
-
-def get_public_monitoring_summary() -> Dict[str, Any]:
-    """Get public monitoring summary"""
-    return {
-        "service": "LifeKB API",
-        "status": "operational",
-        "timestamp": datetime.utcnow().isoformat() + "Z",
-        "endpoints": {
-            "/api/auth": "Authentication services",
-            "/api/entries": "Journal entry operations",
-            "/api/search": "Semantic search",
-            "/api/embeddings": "Embedding management",
-            "/api/monitoring": "System monitoring"
-        },
-        "documentation": "https://github.com/yourusername/lifekb-api",
-        "support": "For monitoring details, authenticate with your API token"
-    }
-
-def test_database_connection(supabase) -> Dict[str, Any]:
-    """Test database connectivity and basic functionality"""
-    try:
-        # Simple query to test connection
-        result = supabase.table('journal_entries').select('id').limit(1).execute()
-        
-        return {
-            "status": "connected",
-            "response_time_ms": "unknown",  # Could measure this
-            "last_check": datetime.utcnow().isoformat() + "Z"
-        }
-        
-    except Exception as e:
-        return {
-            "status": "disconnected",
-            "error": str(e),
-            "last_check": datetime.utcnow().isoformat() + "Z"
-        }
-
-def get_rate_limit_stats() -> Dict[str, Any]:
-    """Get rate limiting statistics"""
-    try:
-        active_users = len(_rate_limit_store)
-        total_tracked_requests = sum(len(requests) for requests in _rate_limit_store.values())
-        
-        return {
-            "active_rate_limited_users": active_users,
-            "total_tracked_requests": total_tracked_requests,
-            "rate_limit_hits": 0  # Would need to track this separately
-        }
-        
-    except Exception as e:
-        logger.error("Failed to get rate limit stats", error=str(e))
-        return {"error": "Failed to get rate limit statistics"}
-
-def get_system_stats() -> Dict[str, Any]:
-    """Get basic system statistics"""
-    try:
-        return {
-            "environment": os.getenv("ENVIRONMENT", "development"),
-            "python_version": "3.9+",
-            "memory_usage": "unknown",  # Could add memory tracking
-            "active_connections": "unknown",  # Could track DB connections
-            "uptime": "unknown"  # Could track since start
-        }
-        
-    except Exception as e:
-        logger.error("Failed to get system stats", error=str(e))
-        return {"error": "Failed to get system statistics"} 
+        return payload.get("user_id")
+    
+    def do_OPTIONS(self):
+        self.send_response(200)
+        self.send_header('Access-Control-Allow-Origin', '*')
+        self.send_header('Access-Control-Allow-Methods', 'GET, OPTIONS')
+        self.send_header('Access-Control-Allow-Headers', 'Content-Type, Authorization')
+        self.end_headers()
+    
+    def do_GET(self):
+        """Handle GET requests - monitoring data"""
+        try:
+            # Parse query parameters
+            parsed_url = urllib.parse.urlparse(self.path)
+            query_params = urllib.parse.parse_qs(parsed_url.query)
+            
+            check_type = query_params.get('type', ['health'])[0]
+            
+            if check_type == 'health':
+                # Public health check (no auth required)
+                health_data = get_system_health()
+                self._send_json_response(200, health_data)
+                
+            elif check_type == 'metrics':
+                # Basic metrics (no auth required, but limited info)
+                metrics_data = get_system_metrics()
+                self._send_json_response(200, {
+                    "success": True,
+                    "metrics": metrics_data
+                })
+                
+            elif check_type == 'endpoints':
+                # Test other API endpoints
+                endpoint_status = test_api_endpoints()
+                self._send_json_response(200, {
+                    "success": True,
+                    "endpoints": endpoint_status,
+                    "timestamp": datetime.utcnow().isoformat() + "Z"
+                })
+                
+            elif check_type == 'full':
+                # Full monitoring report (authentication recommended but not required)
+                user_id = self._verify_auth()
+                
+                health_data = get_system_health()
+                metrics_data = get_system_metrics()
+                endpoint_status = test_api_endpoints()
+                
+                self._send_json_response(200, {
+                    "success": True,
+                    "authenticated": bool(user_id),
+                    "health": health_data,
+                    "metrics": metrics_data,
+                    "endpoints": endpoint_status,
+                    "generated_at": datetime.utcnow().isoformat() + "Z"
+                })
+                
+            else:
+                # Default: API info
+                self._send_json_response(200, {
+                    "api": "LifeKB Monitoring",
+                    "version": "1.0.0", 
+                    "status": "active",
+                    "endpoints": {
+                        "GET ?type=health": "System health check",
+                        "GET ?type=metrics": "Basic system metrics",
+                        "GET ?type=endpoints": "API endpoint status",
+                        "GET ?type=full": "Complete monitoring report"
+                    },
+                    "features": [
+                        "health_monitoring",
+                        "database_status",
+                        "api_endpoint_testing",
+                        "system_metrics",
+                        "environment_validation"
+                    ]
+                })
+                
+        except Exception as e:
+            self._send_error_response(500, f"Server error: {str(e)}") 
