@@ -1,0 +1,695 @@
+{
+	"info": {
+		"_postman_id": "lifekb-api-collection",
+		"name": "LifeKB API - Complete Collection",
+		"description": "Complete API collection for LifeKB personal journaling platform. Perfect for Swift iOS development with comprehensive endpoint coverage, authentication setup, and detailed examples.\n\n## 🔐 Authentication\nMost endpoints require JWT authentication. Use the `/api/auth/login` endpoint first to get your token.\n\n## 📱 iOS Development\nThis collection is optimized for Swift URLSession integration with proper response models and error handling examples.\n\n## 🚀 Base URL\nLocal Development: `http://localhost:3000`\nProduction: `https://your-domain.vercel.app`",
+		"schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+	},
+	"item": [
+		{
+			"name": "🔐 Authentication",
+			"description": "User authentication endpoints for signup, login, and account management",
+			"item": [
+				{
+					"name": "API Status",
+					"request": {
+						"method": "GET",
+						"header": [],
+						"url": {
+							"raw": "{{baseUrl}}/api/auth",
+							"host": ["{{baseUrl}}"],
+							"path": ["api", "auth"]
+						},
+						"description": "Check authentication API status and capabilities"
+					},
+					"response": []
+				},
+				{
+					"name": "Login User",
+					"event": [
+						{
+							"listen": "test",
+							"script": {
+								"exec": [
+									"if (pm.response.code === 200) {",
+									"    const response = pm.response.json();",
+									"    if (response.success && response.token) {",
+									"        pm.environment.set('authToken', response.token);",
+									"        pm.environment.set('userId', response.user.user_id);",
+									"        console.log('✅ Login successful, token saved');",
+									"    }",
+									"}"
+								],
+								"type": "text/javascript"
+							}
+						}
+					],
+					"request": {
+						"method": "POST",
+						"header": [
+							{
+								"key": "Content-Type",
+								"value": "application/json"
+							}
+						],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n    \"email\": \"{{userEmail}}\",\n    \"password\": \"{{userPassword}}\",\n    \"action\": \"login\"\n}"
+						},
+						"url": {
+							"raw": "{{baseUrl}}/api/auth",
+							"host": ["{{baseUrl}}"],
+							"path": ["api", "auth"]
+						},
+						"description": "Login user and receive JWT token. Token is automatically saved to environment variables for subsequent requests."
+					},
+					"response": []
+				},
+				{
+					"name": "Signup User",
+					"event": [
+						{
+							"listen": "test",
+							"script": {
+								"exec": [
+									"if (pm.response.code === 200) {",
+									"    const response = pm.response.json();",
+									"    if (response.success && response.user_id) {",
+									"        pm.environment.set('userId', response.user_id);",
+									"        console.log('✅ Signup successful, user ID saved');",
+									"    }",
+									"}"
+								],
+								"type": "text/javascript"
+							}
+						}
+					],
+					"request": {
+						"method": "POST",
+						"header": [
+							{
+								"key": "Content-Type",
+								"value": "application/json"
+							}
+						],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n    \"email\": \"{{userEmail}}\",\n    \"password\": \"{{userPassword}}\",\n    \"action\": \"signup\"\n}"
+						},
+						"url": {
+							"raw": "{{baseUrl}}/api/auth",
+							"host": ["{{baseUrl}}"],
+							"path": ["api", "auth"]
+						},
+						"description": "Create a new user account. Returns user_id for account creation."
+					},
+					"response": []
+				}
+			]
+		},
+		{
+			"name": "📝 Journal Entries",
+			"description": "CRUD operations for journal entries with automatic embedding generation",
+			"item": [
+				{
+					"name": "List All Entries",
+					"request": {
+						"method": "GET",
+						"header": [
+							{
+								"key": "Authorization",
+								"value": "Bearer {{authToken}}"
+							}
+						],
+						"url": {
+							"raw": "{{baseUrl}}/api/entries",
+							"host": ["{{baseUrl}}"],
+							"path": ["api", "entries"]
+						},
+						"description": "Get all journal entries for the authenticated user. Results are automatically filtered by user_id through RLS."
+					},
+					"response": []
+				},
+				{
+					"name": "Get Single Entry",
+					"request": {
+						"method": "GET",
+						"header": [
+							{
+								"key": "Authorization",
+								"value": "Bearer {{authToken}}"
+							}
+						],
+						"url": {
+							"raw": "{{baseUrl}}/api/entries?id={{entryId}}",
+							"host": ["{{baseUrl}}"],
+							"path": ["api", "entries"],
+							"query": [
+								{
+									"key": "id",
+									"value": "{{entryId}}"
+								}
+							]
+						},
+						"description": "Retrieve a specific journal entry by ID"
+					},
+					"response": []
+				},
+				{
+					"name": "Create New Entry",
+					"event": [
+						{
+							"listen": "test",
+							"script": {
+								"exec": [
+									"// Save entry ID for other requests",
+									"if (pm.response.code === 201) {",
+									"    const response = pm.response.json();",
+									"    if (response.success && response.entry) {",
+									"        pm.environment.set('entryId', response.entry.id);",
+									"        console.log('Entry ID saved:', response.entry.id);",
+									"    }",
+									"}"
+								]
+							}
+						}
+					],
+					"request": {
+						"method": "POST",
+						"header": [
+							{
+								"key": "Authorization",
+								"value": "Bearer {{authToken}}"
+							},
+							{
+								"key": "Content-Type",
+								"value": "application/json"
+							}
+						],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n    \"text\": \"Today was an amazing day! I went for a long walk in the park, had coffee with a close friend, and finished reading a fascinating book about mindfulness. I'm feeling grateful for these simple pleasures in life.\",\n    \"tags\": [\"gratitude\", \"friendship\", \"mindfulness\"],\n    \"category\": \"personal\",\n    \"mood\": 8\n}"
+						},
+						"url": {
+							"raw": "{{baseUrl}}/api/entries",
+							"host": ["{{baseUrl}}"],
+							"path": ["api", "entries"]
+						},
+						"description": "Create a new journal entry. Embedding generation happens automatically in the background."
+					},
+					"response": []
+				},
+				{
+					"name": "Update Entry",
+					"request": {
+						"method": "PUT",
+						"header": [
+							{
+								"key": "Authorization",
+								"value": "Bearer {{authToken}}"
+							},
+							{
+								"key": "Content-Type",
+								"value": "application/json"
+							}
+						],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n    \"text\": \"Updated: Today was an amazing day! I went for a long walk in the park, had coffee with a close friend, and finished reading a fascinating book about mindfulness. I'm feeling grateful for these simple pleasures in life. Added some evening reflection time.\",\n    \"tags\": [\"gratitude\", \"friendship\", \"mindfulness\", \"reflection\"],\n    \"category\": \"personal\",\n    \"mood\": 9\n}"
+						},
+						"url": {
+							"raw": "{{baseUrl}}/api/entries?id={{entryId}}",
+							"host": ["{{baseUrl}}"],
+							"path": ["api", "entries"],
+							"query": [
+								{
+									"key": "id",
+									"value": "{{entryId}}"
+								}
+							]
+						},
+						"description": "Update an existing journal entry. Embedding will be regenerated automatically."
+					},
+					"response": []
+				},
+				{
+					"name": "Delete Entry",
+					"request": {
+						"method": "DELETE",
+						"header": [
+							{
+								"key": "Authorization",
+								"value": "Bearer {{authToken}}"
+							}
+						],
+						"url": {
+							"raw": "{{baseUrl}}/api/entries?id={{entryId}}",
+							"host": ["{{baseUrl}}"],
+							"path": ["api", "entries"],
+							"query": [
+								{
+									"key": "id",
+									"value": "{{entryId}}"
+								}
+							]
+						},
+						"description": "Delete a journal entry permanently"
+					},
+					"response": []
+				}
+			]
+		},
+		{
+			"name": "🔍 Semantic Search",
+			"description": "AI-powered semantic search through journal entries using vector embeddings",
+			"item": [
+				{
+					"name": "Search API Status",
+					"request": {
+						"method": "GET",
+						"header": [],
+						"url": {
+							"raw": "{{baseUrl}}/api/search",
+							"host": ["{{baseUrl}}"],
+							"path": ["api", "search"]
+						},
+						"description": "Check search API capabilities and features"
+					},
+					"response": []
+				},
+				{
+					"name": "Semantic Search",
+					"request": {
+						"method": "POST",
+						"header": [
+							{
+								"key": "Authorization",
+								"value": "Bearer {{authToken}}"
+							},
+							{
+								"key": "Content-Type",
+								"value": "application/json"
+							}
+						],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n    \"query\": \"feeling anxious about work\",\n    \"limit\": 10,\n    \"similarity_threshold\": 0.1\n}"
+						},
+						"url": {
+							"raw": "{{baseUrl}}/api/search",
+							"host": ["{{baseUrl}}"],
+							"path": ["api", "search"]
+						},
+						"description": "Perform semantic search across journal entries. Returns entries ranked by similarity score."
+					},
+					"response": []
+				}
+			]
+		},
+		{
+			"name": "🤖 RAG Search (AI Insights)",
+			"description": "Retrieval-Augmented Generation search with AI-powered insights and analysis",
+			"item": [
+				{
+					"name": "RAG API Status",
+					"request": {
+						"method": "GET",
+						"header": [],
+						"url": {
+							"raw": "{{baseUrl}}/api/search_rag",
+							"host": ["{{baseUrl}}"],
+							"path": ["api", "search_rag"]
+						},
+						"description": "Check RAG API status, available modes, and privacy information"
+					},
+					"response": []
+				},
+				{
+					"name": "RAG Search - Conversational",
+					"request": {
+						"method": "POST",
+						"header": [
+							{
+								"key": "Authorization",
+								"value": "Bearer {{authToken}}"
+							},
+							{
+								"key": "Content-Type",
+								"value": "application/json"
+							}
+						],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n    \"query\": \"How have I been feeling lately?\",\n    \"mode\": \"conversational\",\n    \"include_sources\": true,\n    \"limit\": 10\n}"
+						},
+						"url": {
+							"raw": "{{baseUrl}}/api/search_rag",
+							"host": ["{{baseUrl}}"],
+							"path": ["api", "search_rag"]
+						},
+						"description": "Conversational AI responses about your journal content. Empathetic and supportive tone."
+					},
+					"response": []
+				},
+				{
+					"name": "RAG Search - Summary",
+					"request": {
+						"method": "POST",
+						"header": [
+							{
+								"key": "Authorization",
+								"value": "Bearer {{authToken}}"
+							},
+							{
+								"key": "Content-Type",
+								"value": "application/json"
+							}
+						],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n    \"query\": \"Summarize my mood patterns this month\",\n    \"mode\": \"summary\",\n    \"include_sources\": true,\n    \"limit\": 15\n}"
+						},
+						"url": {
+							"raw": "{{baseUrl}}/api/search_rag",
+							"host": ["{{baseUrl}}"],
+							"path": ["api", "search_rag"]
+						},
+						"description": "Structured summaries of themes and patterns in your journal entries."
+					},
+					"response": []
+				},
+				{
+					"name": "RAG Search - Analysis",
+					"request": {
+						"method": "POST",
+						"header": [
+							{
+								"key": "Authorization",
+								"value": "Bearer {{authToken}}"
+							},
+							{
+								"key": "Content-Type",
+								"value": "application/json"
+							}
+						],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n    \"query\": \"What patterns do you see in my behavior?\",\n    \"mode\": \"analysis\",\n    \"include_sources\": true,\n    \"limit\": 20\n}"
+						},
+						"url": {
+							"raw": "{{baseUrl}}/api/search_rag",
+							"host": ["{{baseUrl}}"],
+							"path": ["api", "search_rag"]
+						},
+						"description": "Deep analytical insights with pattern recognition and behavioral observations."
+					},
+					"response": []
+				}
+			]
+		},
+		{
+			"name": "🔗 Vector Embeddings",
+			"description": "Embedding generation and management for semantic search capabilities",
+			"item": [
+				{
+					"name": "Embeddings API Status",
+					"request": {
+						"method": "GET",
+						"header": [
+							{
+								"key": "Authorization",
+								"value": "Bearer {{authToken}}"
+							}
+						],
+						"url": {
+							"raw": "{{baseUrl}}/api/embeddings",
+							"host": ["{{baseUrl}}"],
+							"path": ["api", "embeddings"]
+						},
+						"description": "Check embeddings API status and available models"
+					},
+					"response": []
+				},
+				{
+					"name": "Generate Single Embedding",
+					"request": {
+						"method": "POST",
+						"header": [
+							{
+								"key": "Authorization",
+								"value": "Bearer {{authToken}}"
+							},
+							{
+								"key": "Content-Type",
+								"value": "application/json"
+							}
+						],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n    \"action\": \"generate\",\n    \"entry_id\": \"{{entryId}}\"\n}"
+						},
+						"url": {
+							"raw": "{{baseUrl}}/api/embeddings",
+							"host": ["{{baseUrl}}"],
+							"path": ["api", "embeddings"]
+						},
+						"description": "Generate embedding for a specific journal entry"
+					},
+					"response": []
+				},
+				{
+					"name": "Batch Generate Embeddings",
+					"request": {
+						"method": "POST",
+						"header": [
+							{
+								"key": "Authorization",
+								"value": "Bearer {{authToken}}"
+							},
+							{
+								"key": "Content-Type",
+								"value": "application/json"
+							}
+						],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n    \"action\": \"process\",\n    \"limit\": 10\n}"
+						},
+						"url": {
+							"raw": "{{baseUrl}}/api/embeddings",
+							"host": ["{{baseUrl}}"],
+							"path": ["api", "embeddings"]
+						},
+						"description": "Process pending embeddings for multiple journal entries in batch"
+					},
+					"response": []
+				}
+			]
+		},
+		{
+			"name": "📊 Analytics & Metadata",
+			"description": "User analytics, insights, and journal metadata analysis",
+			"item": [
+				{
+					"name": "Metadata API Status",
+					"request": {
+						"method": "POST",
+						"header": [],
+						"url": {
+							"raw": "{{baseUrl}}/api/metadata",
+							"host": ["{{baseUrl}}"],
+							"path": ["api", "metadata"]
+						},
+						"description": "Check metadata API capabilities and features"
+					},
+					"response": []
+				},
+				{
+					"name": "User Analytics - 30 Days",
+					"request": {
+						"method": "GET",
+						"header": [
+							{
+								"key": "Authorization",
+								"value": "Bearer {{authToken}}"
+							}
+						],
+						"url": {
+							"raw": "{{baseUrl}}/api/metadata?days=30",
+							"host": ["{{baseUrl}}"],
+							"path": ["api", "metadata"],
+							"query": [
+								{
+									"key": "days",
+									"value": "30"
+								}
+							]
+						},
+						"description": "Get comprehensive analytics for the past 30 days including tag usage, mood trends, and writing insights"
+					},
+					"response": []
+				},
+				{
+					"name": "User Analytics - 7 Days",
+					"request": {
+						"method": "GET",
+						"header": [
+							{
+								"key": "Authorization",
+								"value": "Bearer {{authToken}}"
+							}
+						],
+						"url": {
+							"raw": "{{baseUrl}}/api/metadata?days=7",
+							"host": ["{{baseUrl}}"],
+							"path": ["api", "metadata"],
+							"query": [
+								{
+									"key": "days",
+									"value": "7"
+								}
+							]
+						},
+						"description": "Get weekly analytics summary"
+					},
+					"response": []
+				}
+			]
+		},
+		{
+			"name": "📈 System Monitoring",
+			"description": "System health checks and performance monitoring",
+			"item": [
+				{
+					"name": "Health Check",
+					"request": {
+						"method": "GET",
+						"header": [],
+						"url": {
+							"raw": "{{baseUrl}}/api/monitoring?type=health",
+							"host": ["{{baseUrl}}"],
+							"path": ["api", "monitoring"],
+							"query": [
+								{
+									"key": "type",
+									"value": "health"
+								}
+							]
+						},
+						"description": "Check system health status including database and external API connections"
+					},
+					"response": []
+				},
+				{
+					"name": "System Metrics",
+					"request": {
+						"method": "GET",
+						"header": [],
+						"url": {
+							"raw": "{{baseUrl}}/api/monitoring?type=metrics",
+							"host": ["{{baseUrl}}"],
+							"path": ["api", "monitoring"],
+							"query": [
+								{
+									"key": "type",
+									"value": "metrics"
+								}
+							]
+						},
+						"description": "Get basic system metrics and performance data"
+					},
+					"response": []
+				},
+				{
+					"name": "Endpoint Status",
+					"request": {
+						"method": "GET",
+						"header": [],
+						"url": {
+							"raw": "{{baseUrl}}/api/monitoring?type=endpoints",
+							"host": ["{{baseUrl}}"],
+							"path": ["api", "monitoring"],
+							"query": [
+								{
+									"key": "type",
+									"value": "endpoints"
+								}
+							]
+						},
+						"description": "Check status of all API endpoints"
+					},
+					"response": []
+				},
+				{
+					"name": "Full System Report",
+					"request": {
+						"method": "GET",
+						"header": [
+							{
+								"key": "Authorization",
+								"value": "Bearer {{authToken}}",
+								"description": "Optional - provides additional authenticated metrics"
+							}
+						],
+						"url": {
+							"raw": "{{baseUrl}}/api/monitoring?type=full",
+							"host": ["{{baseUrl}}"],
+							"path": ["api", "monitoring"],
+							"query": [
+								{
+									"key": "type",
+									"value": "full"
+								}
+							]
+						},
+						"description": "Complete system monitoring report with all available metrics"
+					},
+					"response": []
+				}
+			]
+		}
+	],
+	"event": [
+		{
+			"listen": "prerequest",
+			"script": {
+				"type": "text/javascript",
+				"exec": [
+					"// Ensure environment variables are available",
+					"if (!pm.environment.get('baseUrl')) {",
+					"    pm.environment.set('baseUrl', 'http://localhost:3000');",
+					"    console.log('Set default baseUrl to localhost:3000');",
+					"}",
+					"",
+					"// Log current auth status",
+					"const token = pm.environment.get('authToken');",
+					"if (token) {",
+					"    console.log('Auth token is available');",
+					"} else {",
+					"    console.log('No auth token - use login endpoint first');",
+					"}"
+				]
+			}
+		}
+	],
+	"variable": [
+		{
+			"key": "baseUrl",
+			"value": "http://localhost:3000",
+			"type": "string",
+			"description": "Base URL for the API"
+		},
+		{
+			"key": "userEmail",
+			"value": "test@example.com",
+			"type": "string",
+			"description": "Test user email for authentication"
+		},
+		{
+			"key": "userPassword",
+			"value": "testpassword123",
+			"type": "string",
+			"description": "Test user password for authentication"
+		}
+	]
+} 
