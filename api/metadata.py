@@ -276,7 +276,12 @@ class handler(BaseHTTPRequestHandler):
             return None
         
         token = auth_header[7:]
-        jwt_secret = os.environ.get("JWT_SECRET_KEY", "fallback-secret-key")
+        # Get JWT secret (no fallback for security)
+        jwt_secret = os.environ.get("JWT_SECRET_KEY")
+        if not jwt_secret:
+            self._send_error_response(500, "Server configuration error")
+            return None
+        
         valid, payload, _ = JWTHandler.decode_jwt(token, jwt_secret)
         
         if not valid:
@@ -295,7 +300,6 @@ class handler(BaseHTTPRequestHandler):
         """Handle GET requests - user metadata stats"""
         user_id = self._verify_auth()
         if not user_id:
-            self._send_error_response(401, "Authentication required")
             return
         
         try:

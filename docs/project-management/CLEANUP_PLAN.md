@@ -38,12 +38,12 @@ Streamlined the LifeKB codebase by removing redundant files, outdated implementa
 ```
 LifeKbServer/
 ├── api/                           # 6 PRODUCTION ENDPOINTS
-│   ├── auth_working.py            # ✅ Authentication
-│   ├── entries.py                 # ✅ Journal CRUD
-│   ├── embeddings.py              # ✅ Vector embeddings
-│   ├── search.py                  # ✅ Semantic search
-│   ├── metadata.py                # ✅ NEW - User analytics
-│   └── monitoring.py              # ✅ NEW - System monitoring
+│   ├── auth.py              # ✅ Authentication (renamed from auth_working)
+│   ├── entries.py           # ✅ Journal CRUD operations
+│   ├── embeddings.py        # ✅ Vector embedding generation
+│   ├── search.py            # ✅ Semantic search queries  
+│   ├── metadata.py          # ✅ User analytics/statistics
+│   └── monitoring.py        # ✅ System health monitoring
 ├── docs/                          # DOCUMENTATION
 │   ├── API_DOCUMENTATION.md       # ✅ Updated with new endpoints
 │   └── MULTI_USER_ARCHITECTURE.md # ✅ User isolation details

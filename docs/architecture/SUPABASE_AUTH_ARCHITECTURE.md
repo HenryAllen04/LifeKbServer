@@ -65,7 +65,7 @@ def do_GET(self):
 ## System Components
 
 ### 1. Authentication Endpoints
-- **`/api/auth_working`** - Login/register using Supabase Auth API
+- **`/api/auth`** - Login/register using Supabase Auth API
 - Returns JWT tokens for authenticated requests
 - Creates users in `auth.users` automatically
 
@@ -106,7 +106,7 @@ def do_GET(self):
 ### Authentication Flow
 1. **User Registration/Login**
    ```
-   POST /api/auth_working
+   POST /api/auth
    {
      "action": "login",
      "email": "user@example.com", 
@@ -168,7 +168,7 @@ OPENAI_API_KEY=your-openai-key
 ### 1. Authentication Test
 ```bash
 # Login and get JWT token
-curl -X POST "https://your-app.vercel.app/api/auth_working" \
+curl -X POST "https://life-kb-server-henryallen04-henryallen04s-projects.vercel.app/api/auth" \
   -H "Content-Type: application/json" \
   -d '{"action": "login", "email": "demo@example.com", "password": "demo123"}'
 ```
@@ -176,8 +176,8 @@ curl -X POST "https://your-app.vercel.app/api/auth_working" \
 ### 2. Authenticated API Test
 ```bash
 # Use JWT token for API access
-curl -X GET "https://your-app.vercel.app/api/entries" \
-  -H "Authorization: Bearer <jwt_token>"
+curl -X GET "https://life-kb-server-henryallen04-henryallen04s-projects.vercel.app/api/entries" \
+  -H "Authorization: Bearer YOUR_JWT_TOKEN"
 ```
 
 ### 3. User Isolation Test
@@ -244,3 +244,39 @@ class handler(BaseHTTPRequestHandler):
 4. **Use JWT for stateless authentication**
 5. **Test user isolation** thoroughly
 6. **Follow the migration pattern** for schema changes 
+
+## 🔄 Authentication Flow Diagram
+
+```mermaid
+sequenceDiagram
+    participant U as User
+    participant API as LifeKB API
+    participant S as Supabase Auth
+    participant DB as PostgreSQL
+
+    U->>API: POST /api/auth
+    API->>S: Login request
+    S->>API: User data + session
+    API->>API: Generate JWT token
+    API->>U: Return JWT token
+    
+    Note over U,DB: Subsequent requests
+    U->>API: Request with JWT
+    API->>API: Verify JWT
+    API->>DB: Query with user_id
+    DB->>API: User-specific data
+    API->>U: Response
+```
+
+## 🚀 API Endpoint Details
+
+### Authentication Endpoint
+
+**Endpoint**: `/api/auth`
+**Methods**: GET, POST
+
+**List Entries:**
+```bash
+curl -X GET "https://life-kb-server-henryallen04-henryallen04s-projects.vercel.app/api/entries" \
+  -H "Authorization: Bearer YOUR_JWT_TOKEN"
+``` 

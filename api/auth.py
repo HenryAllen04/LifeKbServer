@@ -458,7 +458,11 @@ class handler(BaseHTTPRequestHandler):
                 return
             
             # Create our own JWT token with the real user ID from Supabase
-            jwt_secret = os.environ.get("JWT_SECRET_KEY", "fallback-secret-key")
+            jwt_secret = os.environ.get("JWT_SECRET_KEY")
+            if not jwt_secret:
+                self._send_error_response(500, "Server configuration error")
+                return
+            
             payload = {
                 "user_id": user_id,  # Real user ID from Supabase auth.users
                 "email": email,
@@ -566,7 +570,11 @@ class handler(BaseHTTPRequestHandler):
             self._send_error_response(400, "Token required")
             return
         
-        jwt_secret = os.environ.get("JWT_SECRET_KEY", "fallback-secret-key")
+        jwt_secret = os.environ.get("JWT_SECRET_KEY")
+        if not jwt_secret:
+            self._send_error_response(500, "Server configuration error")
+            return
+        
         valid, payload, error = JWTHandler.decode_jwt(token, jwt_secret)
         
         if valid:
@@ -589,7 +597,11 @@ class handler(BaseHTTPRequestHandler):
             self._send_error_response(400, "Token required")
             return
         
-        jwt_secret = os.environ.get("JWT_SECRET_KEY", "fallback-secret-key")
+        jwt_secret = os.environ.get("JWT_SECRET_KEY")
+        if not jwt_secret:
+            self._send_error_response(500, "Server configuration error")
+            return
+        
         valid, payload, error = JWTHandler.decode_jwt(token, jwt_secret)
         
         if valid:
@@ -619,7 +631,10 @@ class handler(BaseHTTPRequestHandler):
             return False
         
         token = auth_header[7:]  # Remove 'Bearer ' prefix
-        jwt_secret = os.environ.get("JWT_SECRET_KEY", "fallback-secret-key")
+        jwt_secret = os.environ.get("JWT_SECRET_KEY")
+        if not jwt_secret:
+            return False
+        
         valid, payload, _ = JWTHandler.decode_jwt(token, jwt_secret)
         
         if not valid:

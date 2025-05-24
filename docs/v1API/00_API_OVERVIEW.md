@@ -14,7 +14,7 @@ All API endpoints (except auth) require JWT Bearer token authentication:
 Authorization: Bearer <jwt_token>
 ```
 
-Get tokens via the `/api/auth_working` endpoint.
+Get tokens via the `/api/auth` endpoint.
 
 ## Core Features
 - ✅ **User Authentication** - JWT-based with Supabase Auth
@@ -29,28 +29,25 @@ Get tokens via the `/api/auth_working` endpoint.
 ### Authentication
 | Endpoint | Method | Description |
 |----------|--------|-------------|
-| [`/api/auth_working`](./auth.md) | POST | Login/register users |
+| [`/api/auth`](./auth.md) | POST | Login/register users |
 
 ### Journal Management  
 | Endpoint | Method | Description |
 |----------|--------|-------------|
 | [`/api/entries`](./entries.md) | GET | List user's journal entries |
 | [`/api/entries`](./entries.md) | POST | Create new journal entry |
-| [`/api/entries?id={id}`](./entries.md) | GET | Get specific entry |
 | [`/api/entries`](./entries.md) | PUT | Update existing entry |
 | [`/api/entries`](./entries.md) | DELETE | Delete entry |
 
 ### AI & Embeddings
 | Endpoint | Method | Description |
 |----------|--------|-------------|
-| [`/api/embeddings`](./embeddings.md) | GET | Get embedding status/info |
-| [`/api/embeddings`](./embeddings.md) | POST | Process pending embeddings |
+| [`/api/embeddings`](./embeddings.md) | GET | Get embedding status |
+| [`/api/embeddings`](./embeddings.md) | POST | Generate embeddings |
 
 ### Utilities
 | Endpoint | Method | Description |
 |----------|--------|-------------|
-| [`/api/setup_demo`](./setup_demo.md) | GET | Check demo setup status |
-| [`/api/setup_demo`](./setup_demo.md) | POST | Create demo data |
 | [`/api/fix_database_schema`](./database_fix.md) | GET | Diagnose database schema |
 | [`/api/fix_database_schema`](./database_fix.md) | POST | Fix database constraints |
 
@@ -143,9 +140,13 @@ OPENAI_API_KEY=your-openai-key
 
 ### 1. Authentication
 ```bash
-curl -X POST "/api/auth_working" \
+curl -X POST "/api/auth" \
   -H "Content-Type: application/json" \
-  -d '{"action": "login", "email": "demo@example.com", "password": "demo123"}'
+  -d '{
+    "action": "login",
+    "email": "your-email@example.com", 
+    "password": "your-password"
+  }'
 ```
 
 ### 2. Create Entry

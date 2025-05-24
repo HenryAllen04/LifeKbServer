@@ -94,7 +94,7 @@
 ```
 LifeKbServer/
 ├── api/                    # 6 PRODUCTION ENDPOINTS
-│   ├── auth_working.py     # ✅ Authentication
+│   ├── auth.py             # ✅ Authentication
 │   ├── entries.py          # ✅ Journal CRUD
 │   ├── embeddings.py       # ✅ Vector embeddings
 │   ├── search.py           # ✅ Semantic search

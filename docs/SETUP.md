@@ -19,10 +19,17 @@ OPENAI_API_KEY=your-openai-api-key-here
 ```
 
 ### 3. Security Configuration
-Use this generated JWT secret key:
+⚠️ **SECURITY WARNING**: Generate your own unique JWT secret key!
 ```env
-JWT_SECRET_KEY=hlGuCEgOxXKUEJvWxZbyiRLIHr0jPnjRIjQOnn5V-z8
+JWT_SECRET_KEY=GENERATE_YOUR_OWN_SECRET_32_CHARS_MIN
 ```
+
+**To generate a secure JWT secret:**
+```python
+import secrets
+print(secrets.token_urlsafe(32))
+```
+**Never use example keys in production!**
 
 ### 4. CORS Origins
 For development (add production domain after Vercel deployment):
