@@ -85,6 +85,7 @@ GRANT ALL ON TABLE journal_entries TO authenticated;
 GRANT EXECUTE ON FUNCTION search_entries TO authenticated;
 
 -- Create a view for embedding statistics
+-- Note: Views inherit RLS policies from underlying tables, no separate RLS policy needed
 CREATE OR REPLACE VIEW embedding_stats AS
 SELECT 
     user_id,
@@ -98,7 +99,3 @@ GROUP BY user_id;
 
 -- Grant access to the view
 GRANT SELECT ON embedding_stats TO authenticated;
-
--- Create RLS policy for the view  
-CREATE POLICY "Users can see own embedding stats" ON embedding_stats
-    FOR SELECT USING (auth.uid() = user_id);
