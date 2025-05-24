@@ -202,8 +202,13 @@ def get_system_metrics() -> Dict[str, Any]:
 def test_api_endpoints() -> Dict[str, Any]:
     """Test availability of other API endpoints"""
     base_url = os.environ.get("VERCEL_URL", "localhost:3000")
+    
+    # Use appropriate protocol based on environment
     if not base_url.startswith("http"):
-        base_url = f"https://{base_url}"
+        if "localhost" in base_url or base_url.startswith("127.0.0.1"):
+            base_url = f"http://{base_url}"  # HTTP for localhost
+        else:
+            base_url = f"https://{base_url}"  # HTTPS for production
     
     endpoints = {
         "auth": f"{base_url}/api/auth",

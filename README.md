@@ -20,6 +20,7 @@ The system successfully processes real users, generates embeddings, and performs
 | `/api/entries` | ✅ **LIVE** | Complete CRUD operations for journal entries |
 | `/api/embeddings` | ✅ **LIVE** | OpenAI vector embedding generation |
 | `/api/search` | ✅ **LIVE** | Semantic search with cosine similarity |
+| `/api/search_rag` | ✅ **NEW** | RAG - AI-powered responses with GPT-4o-mini |
 | `/api/metadata` | ✅ **NEW** | User analytics, tag statistics, mood trends |
 | `/api/monitoring` | ✅ **NEW** | System health checks, performance metrics |
 
@@ -148,6 +149,71 @@ curl -X POST https://lifekb.vercel.app/api/search \
   -d '{"query": "artificial intelligence", "limit": 10}'
 ```
 
+## 📮 Postman API Collection
+
+**Complete API testing suite for developers and iOS integration**
+
+A comprehensive Postman collection with all LifeKB API endpoints has been created to facilitate easy testing and iOS app development.
+
+### 📁 Collection Contents
+- **25+ API endpoints** organized in 7 categories:
+  - 🔐 **Authentication** - Login, signup, token management
+  - 📝 **Journal Entries** - CRUD operations for journal entries
+  - 🔍 **Semantic Search** - Vector similarity search with configurable parameters
+  - 🤖 **RAG Search** - AI-powered responses with 3 different modes
+  - 🔗 **Vector Embeddings** - OpenAI embedding generation and management
+  - 📊 **Analytics & Metadata** - User insights and statistics
+  - 📈 **System Monitoring** - Health checks and performance metrics
+
+### 🚀 Quick Setup
+1. **Import Collection**: Import `postman/LifeKB_API_Collection.postman_collection.json`
+2. **Import Environment**: Import either:
+   - `postman/LifeKB_Local_Environment.postman_environment.json` (local dev)
+   - `postman/LifeKB_Production_Environment.postman_environment.json` (production)
+3. **Configure Variables**: Update `base_url`, `supabase_url`, and API keys in your environment
+4. **Start Testing**: Use the "Auth > Login" request to get a JWT token for authenticated endpoints
+
+### 📱 iOS Development
+- **Swift Integration Guide**: `docs/Swift_Integration_Guide.md` - Complete iOS integration with URLSession examples
+- **Model Definitions**: Ready-to-use Swift structs for all API responses
+- **Authentication Flow**: JWT token management with automatic header injection
+- **Error Handling**: Custom APIError enum for robust error handling
+
+### 📚 Collection Documentation
+See `postman/README_Postman_Collection.md` for detailed usage instructions, authentication setup, and iOS development examples.
+
+## 🤖 RAG (Retrieval-Augmented Generation)
+
+**AI-powered insights from your journal entries**
+
+LifeKB now includes an optional RAG feature that provides AI-generated insights while maintaining privacy-first principles.
+
+### 🎯 RAG Features
+- **Three AI Modes**:
+  - **Conversational**: Warm, empathetic therapist-like responses
+  - **Summary**: Structured overviews with bullet points and data
+  - **Analysis**: Deep analytical insights with pattern recognition
+- **Privacy-First**: Explicit opt-in required, data minimization practices
+- **Source Attribution**: All responses include source journal entries
+- **GPT-4o-mini Integration**: Cost-effective AI responses ($0.01-0.05 per query)
+
+### 🔧 RAG API Usage
+```bash
+curl -X POST https://lifekb.vercel.app/api/search_rag \
+  -H "Authorization: Bearer YOUR_JWT_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "query": "How has my mood changed over the past month?",
+    "mode": "analysis",
+    "include_sources": true
+  }'
+```
+
+### 📖 RAG Documentation
+- **Implementation Guide**: `docs/RAG_IMPLEMENTATION.md`
+- **API Reference**: `docs/rag-api.md`
+- **Testing Guide**: `docs/TESTING_RAG.md`
+
 ## 📁 Project Structure
 
 ```
@@ -157,12 +223,22 @@ LifeKbServer/
 │   ├── entries.py          # ✅ Journal CRUD operations  
 │   ├── embeddings.py       # ✅ Vector embedding generation
 │   ├── search.py           # ✅ Semantic search
+│   ├── search_rag.py       # ✅ NEW - RAG (AI-powered responses)
 │   ├── metadata.py         # ✅ NEW - User analytics
 │   └── monitoring.py       # ✅ NEW - System monitoring
+├── postman/                # 📮 API testing collection
+│   ├── LifeKB_API_Collection.postman_collection.json
+│   ├── LifeKB_Local_Environment.postman_environment.json
+│   ├── LifeKB_Production_Environment.postman_environment.json
+│   └── README_Postman_Collection.md
 ├── api_backup/             # 🗑️ Legacy/backup files (can be cleaned)
 ├── docs/                   # 📚 Comprehensive documentation
-│   ├── API_DOCUMENTATION.md  # Complete API reference with diagrams
-│   └── MULTI_USER_ARCHITECTURE.md  # User isolation details
+│   ├── API_DOCUMENTATION.md          # Complete API reference with diagrams
+│   ├── MULTI_USER_ARCHITECTURE.md    # User isolation details
+│   ├── Swift_Integration_Guide.md    # 📱 NEW - iOS development guide
+│   ├── RAG_IMPLEMENTATION.md         # 🤖 NEW - RAG feature documentation
+│   ├── rag-api.md                    # 🤖 NEW - RAG API reference
+│   └── TESTING_RAG.md                # 🤖 NEW - RAG testing guide
 ├── supabase/
 │   └── migrations/         # Database schema migrations
 ├── scripts/                # Database maintenance scripts
