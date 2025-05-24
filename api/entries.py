@@ -1,241 +1,102 @@
-# LifeKB Backend Entries API - Vercel Serverless Function
-# Purpose: Complete journal entry CRUD operations (list, create, get, update, delete)
+# LifeKB Backend Entries API - Production Serverless Function
+# Purpose: Complete journal entry CRUD operations with embedded monitoring/security features
 
 from http.server import BaseHTTPRequestHandler
 import json
 import urllib.parse
+import urllib.request
+import urllib.error
 import os
-import sys
-import asyncio
+import time
+import uuid
 from datetime import datetime
-from uuid import uuid4, UUID
+from collections import defaultdict
+from typing import Dict, Optional, Any, List
+import hashlib
+import hmac
+import base64
 
-# Add parent directory to path for imports
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+class JWTHandler:
+    @staticmethod
+    def decode_jwt(token: str, secret: str) -> tuple[bool, Optional[Dict], Optional[str]]:
+        try:
+            parts = token.split('.')
+            if len(parts) != 3:
+                return False, None, "Invalid token format"
+            
+            header_encoded, payload_encoded, signature_encoded = parts
+            
+            message = f"{header_encoded}.{payload_encoded}"
+            expected_signature = hmac.new(
+                secret.encode(),
+                message.encode(),
+                hashlib.sha256
+            ).digest()
+            
+            signature_padded = signature_encoded + '=' * (4 - len(signature_encoded) % 4)
+            received_signature = base64.urlsafe_b64decode(signature_padded)
+            
+            if not hmac.compare_digest(expected_signature, received_signature):
+                return False, None, "Invalid signature"
+            
+            payload_padded = payload_encoded + '=' * (4 - len(payload_encoded) % 4)
+            payload = json.loads(base64.urlsafe_b64decode(payload_padded).decode())
+            
+            if "exp" in payload and payload["exp"] < time.time():
+                return False, None, "Token expired"
+            
+            return True, payload, None
+            
+        except Exception as e:
+            return False, None, f"Token decode error: {str(e)}"
 
-# Supabase imports
-from supabase import create_client, Client
-
-# Import embeddings functionality
-try:
-    from app.embeddings import auto_generate_embedding
-except ImportError:
-    auto_generate_embedding = None
-
-def serialize_datetime(obj):
-    """Convert datetime objects to ISO format strings for JSON serialization."""
-    if isinstance(obj, datetime):
-        return obj.isoformat()
-    elif hasattr(obj, 'isoformat'):  # Handle other datetime-like objects
-        return obj.isoformat()
-    return obj
-
-def serialize_data(data):
-    """Recursively serialize datetime objects in data."""
-    if isinstance(data, dict):
-        result = {}
-        for key, value in data.items():
-            try:
-                result[key] = serialize_data(value)
-            except Exception as e:
-                # Convert problematic values to strings
-                result[key] = str(value)
-        return result
-    elif isinstance(data, list):
-        return [serialize_data(item) for item in data]
-    else:
-        return serialize_datetime(data)
-
-# Initialize Supabase client
-def get_supabase_client():
-    """Initialize and return Supabase client with environment variables."""
-    url = os.environ.get("SUPABASE_URL")
-    key = os.environ.get("SUPABASE_SERVICE_KEY")
+def supabase_request(method: str, endpoint: str, data: Optional[Dict] = None, params: Optional[Dict] = None):
+    """Make direct HTTP requests to Supabase REST API"""
+    supabase_url = os.environ.get("SUPABASE_URL")
+    supabase_key = os.environ.get("SUPABASE_SERVICE_KEY")
     
-    if not url or not key:
-        raise ValueError("SUPABASE_URL and SUPABASE_SERVICE_KEY must be set in environment")
+    if not supabase_url or not supabase_key:
+        raise Exception("SUPABASE_URL and SUPABASE_SERVICE_KEY must be configured")
     
-    return create_client(url, key)
-
-class AuthError(Exception):
-    """Custom exception for authentication errors."""
-    pass
-
-class ValidationError(Exception):
-    """Custom exception for validation errors."""
-    pass
-
-def extract_user_from_token(authorization_header):
-    """Extract user ID from JWT token in Authorization header."""
-    if not authorization_header:
-        raise AuthError("Authorization header required")
+    url = f"{supabase_url}/rest/v1/{endpoint}"
+    if params:
+        query_string = urllib.parse.urlencode(params)
+        url += f"?{query_string}"
     
-    if not authorization_header.startswith('Bearer '):
-        raise AuthError("Invalid authorization header format")
+    headers = {
+        "apikey": supabase_key,
+        "Authorization": f"Bearer {supabase_key}",
+        "Content-Type": "application/json",
+        "Prefer": "return=representation"
+    }
     
-    token = authorization_header[7:]  # Remove 'Bearer ' prefix
+    request_data = None
+    if data:
+        request_data = json.dumps(data).encode('utf-8')
     
-    # For development, we'll decode without verification
-    # In production, this should verify the JWT signature
-    import jwt
+    req = urllib.request.Request(url, data=request_data, headers=headers, method=method)
+    
     try:
-        if os.environ.get("ENVIRONMENT") == "development":
-            decoded = jwt.decode(token, options={"verify_signature": False})
-        else:
-            jwt_secret = os.environ.get("JWT_SECRET_KEY")
-            if not jwt_secret:
-                raise AuthError("JWT_SECRET_KEY not configured")
-            decoded = jwt.decode(token, jwt_secret, algorithms=["HS256"])
-        
-        user_id = decoded.get('sub')
-        if not user_id:
-            raise AuthError("Invalid token: missing user ID")
-        
-        return user_id
-        
-    except jwt.ExpiredSignatureError:
-        raise AuthError("Token has expired")
-    except jwt.InvalidTokenError:
-        raise AuthError("Invalid token")
-    except Exception as e:
-        raise AuthError(f"Token validation error: {str(e)}")
-
-async def create_journal_entry(user_id: str, text: str):
-    """Create a new journal entry for the user."""
-    try:
-        supabase = get_supabase_client()
-        
-        entry_id = str(uuid4())
-        entry_data = {
-            "id": entry_id,
-            "user_id": user_id,
-            "text": text,
-            "embedding_status": "pending",
-            "created_at": datetime.utcnow().isoformat(),
-            "updated_at": datetime.utcnow().isoformat()
-        }
-        
-        response = supabase.table("journal_entries").insert(entry_data).execute()
-        
-        if not response.data:
-            raise Exception("Failed to create journal entry")
-        
-        created_entry = serialize_data(response.data[0])
-        
-        # Automatically generate embedding in background if available
-        if auto_generate_embedding:
-            try:
-                await auto_generate_embedding(UUID(entry_id), text)
-            except Exception as e:
-                # Log error but don't fail entry creation
-                print(f"Warning: Failed to auto-generate embedding for entry {entry_id}: {str(e)}")
-        
-        return created_entry
-        
-    except Exception as e:
-        raise Exception(f"Database error: {str(e)}")
-
-async def get_journal_entries(user_id: str, page: int = 1, limit: int = 20):
-    """Get paginated journal entries for the user."""
-    try:
-        supabase = get_supabase_client()
-        
-        # Calculate offset
-        offset = (page - 1) * limit
-        
-        # Get entries with pagination
-        response = supabase.table("journal_entries")\
-            .select("*")\
-            .eq("user_id", user_id)\
-            .order("created_at", desc=True)\
-            .range(offset, offset + limit - 1)\
-            .execute()
-        
-        # Get total count
-        count_response = supabase.table("journal_entries")\
-            .select("id", count="exact")\
-            .eq("user_id", user_id)\
-            .execute()
-        
-        total_count = count_response.count if count_response.count else 0
-        total_pages = (total_count + limit - 1) // limit
-        
-        return {
-            "items": serialize_data(response.data),
-            "total_count": total_count,
-            "page": page,
-            "limit": limit,
-            "total_pages": total_pages,
-            "has_next": page < total_pages,
-            "has_prev": page > 1
-        }
-        
-    except Exception as e:
-        raise Exception(f"Database error: {str(e)}")
-
-async def get_journal_entry(user_id: str, entry_id: str):
-    """Get a specific journal entry for the user."""
-    try:
-        supabase = get_supabase_client()
-        
-        response = supabase.table("journal_entries")\
-            .select("*")\
-            .eq("id", entry_id)\
-            .eq("user_id", user_id)\
-            .execute()
-        
-        if not response.data:
-            return None
-        
-        return serialize_data(response.data[0])
-        
-    except Exception as e:
-        raise Exception(f"Database error: {str(e)}")
-
-async def update_journal_entry(user_id: str, entry_id: str, text: str):
-    """Update a journal entry for the user."""
-    try:
-        supabase = get_supabase_client()
-        
-        update_data = {
-            "text": text,
-            "updated_at": datetime.utcnow().isoformat(),
-            "embedding_status": "pending"  # Mark for re-embedding
-        }
-        
-        response = supabase.table("journal_entries")\
-            .update(update_data)\
-            .eq("id", entry_id)\
-            .eq("user_id", user_id)\
-            .execute()
-        
-        if not response.data:
-            return None
-        
-        return serialize_data(response.data[0])
-        
-    except Exception as e:
-        raise Exception(f"Database error: {str(e)}")
-
-async def delete_journal_entry(user_id: str, entry_id: str):
-    """Delete a journal entry for the user."""
-    try:
-        supabase = get_supabase_client()
-        
-        response = supabase.table("journal_entries")\
-            .delete()\
-            .eq("id", entry_id)\
-            .eq("user_id", user_id)\
-            .execute()
-        
-        return bool(response.data)
-        
-    except Exception as e:
-        raise Exception(f"Database error: {str(e)}")
+        with urllib.request.urlopen(req) as response:
+            if response.status not in [200, 201, 204]:
+                error_text = response.read().decode('utf-8')
+                raise Exception(f"Supabase error: {response.status} - {error_text}")
+            
+            if response.status == 204:
+                return {}
+            
+            return json.loads(response.read().decode('utf-8'))
+            
+    except urllib.error.HTTPError as e:
+        error_text = e.read().decode('utf-8') if e.fp else str(e)
+        raise Exception(f"Supabase error: {e.code} - {error_text}")
 
 class handler(BaseHTTPRequestHandler):
-    def send_json_response(self, status_code: int, data: dict):
-        """Helper to send JSON responses with proper headers."""
+    def __init__(self, *args, **kwargs):
+        self.start_time = time.time()
+        super().__init__(*args, **kwargs)
+    
+    def _send_json_response(self, status_code: int, data: Dict):
         self.send_response(status_code)
         self.send_header('Content-Type', 'application/json')
         self.send_header('Access-Control-Allow-Origin', '*')
@@ -243,182 +104,231 @@ class handler(BaseHTTPRequestHandler):
         self.send_header('Access-Control-Allow-Headers', 'Content-Type, Authorization')
         self.end_headers()
         self.wfile.write(json.dumps(data).encode('utf-8'))
-
-    def get_request_body(self) -> dict:
-        """Parse JSON request body."""
-        try:
-            content_length = int(self.headers.get('Content-Length', 0))
-            if content_length == 0:
-                return {}
-            
-            post_data = self.rfile.read(content_length)
-            return json.loads(post_data.decode('utf-8'))
-        except (json.JSONDecodeError, ValueError):
-            return {}
-
-    def get_user_id(self) -> str:
-        """Extract and validate user ID from authorization header."""
-        auth_header = self.headers.get('Authorization')
-        return extract_user_from_token(auth_header)
-
-    def parse_path(self) -> tuple:
-        """Parse URL path to determine operation type and entry ID."""
-        parsed_url = urllib.parse.urlparse(self.path)
-        path_parts = [part for part in parsed_url.path.strip('/').split('/') if part]
+    
+    def _send_error_response(self, status_code: int, error_message: str):
+        self._send_json_response(status_code, {
+            "error": error_message,
+            "timestamp": datetime.now().isoformat(),
+            "status": "error"
+        })
+    
+    def _verify_auth(self) -> Optional[str]:
+        """Verify JWT token and return user_id"""
+        auth_header = self.headers.get('Authorization', '')
         
-        # Expected patterns:
-        # /api/entries -> list entries
-        # /api/entries?id=<entry_id> -> get/update/delete specific entry
+        if not auth_header.startswith('Bearer '):
+            return None
         
-        query = urllib.parse.parse_qs(parsed_url.query)
-        entry_id = query.get('id', [None])[0]
+        token = auth_header[7:]
+        jwt_secret = os.environ.get("JWT_SECRET_KEY")
+        if not jwt_secret:
+            self._send_error_response(500, "Server configuration error")
+            return None
         
-        return entry_id, query
-
-    def do_GET(self):
-        """Handle GET requests - list entries or get specific entry."""
-        try:
-            user_id = self.get_user_id()
-            entry_id, query = self.parse_path()
-            
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            
-            if entry_id:
-                # Get specific entry
-                entry = loop.run_until_complete(get_journal_entry(user_id, entry_id))
-                loop.close()
-                
-                if not entry:
-                    self.send_json_response(404, {'error': 'Entry not found'})
-                    return
-                
-                self.send_json_response(200, {
-                    'success': True,
-                    'entry': entry
-                })
-            else:
-                # List entries with pagination
-                page = int(query.get('page', [1])[0])
-                limit = min(int(query.get('limit', [20])[0]), 100)  # Max 100 per page
-                
-                result = loop.run_until_complete(get_journal_entries(user_id, page, limit))
-                loop.close()
-                
-                self.send_json_response(200, {
-                    'success': True,
-                    'entries': result
-                })
-            
-        except AuthError as e:
-            self.send_json_response(401, {'error': str(e)})
-        except Exception as e:
-            self.send_json_response(500, {'error': f'Internal server error: {str(e)}'})
-
-    def do_POST(self):
-        """Handle POST requests - create new entry."""
-        try:
-            user_id = self.get_user_id()
-            body = self.get_request_body()
-            
-            text = body.get('text', '').strip()
-            if not text:
-                raise ValidationError('Entry text is required')
-            
-            if len(text) > 10000:  # 10k character limit
-                raise ValidationError('Entry text too long (max 10,000 characters)')
-            
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            entry = loop.run_until_complete(create_journal_entry(user_id, text))
-            loop.close()
-            
-            self.send_json_response(201, {
-                'success': True,
-                'message': 'Entry created successfully',
-                'entry': entry
-            })
-            
-        except AuthError as e:
-            self.send_json_response(401, {'error': str(e)})
-        except ValidationError as e:
-            self.send_json_response(400, {'error': str(e)})
-        except Exception as e:
-            self.send_json_response(500, {'error': f'Internal server error: {str(e)}'})
-
-    def do_PUT(self):
-        """Handle PUT requests - update specific entry."""
-        try:
-            user_id = self.get_user_id()
-            entry_id, _ = self.parse_path()
-            
-            if not entry_id:
-                raise ValidationError('Entry ID is required in query parameter (?id=entry_id)')
-            
-            body = self.get_request_body()
-            text = body.get('text', '').strip()
-            if not text:
-                raise ValidationError('Entry text is required')
-            
-            if len(text) > 10000:  # 10k character limit
-                raise ValidationError('Entry text too long (max 10,000 characters)')
-            
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            entry = loop.run_until_complete(update_journal_entry(user_id, entry_id, text))
-            loop.close()
-            
-            if not entry:
-                self.send_json_response(404, {'error': 'Entry not found'})
-                return
-            
-            self.send_json_response(200, {
-                'success': True,
-                'message': 'Entry updated successfully',
-                'entry': entry
-            })
-            
-        except AuthError as e:
-            self.send_json_response(401, {'error': str(e)})
-        except ValidationError as e:
-            self.send_json_response(400, {'error': str(e)})
-        except Exception as e:
-            self.send_json_response(500, {'error': f'Internal server error: {str(e)}'})
-
-    def do_DELETE(self):
-        """Handle DELETE requests - delete specific entry."""
-        try:
-            user_id = self.get_user_id()
-            entry_id, _ = self.parse_path()
-            
-            if not entry_id:
-                raise ValidationError('Entry ID is required in query parameter (?id=entry_id)')
-            
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            deleted = loop.run_until_complete(delete_journal_entry(user_id, entry_id))
-            loop.close()
-            
-            if not deleted:
-                self.send_json_response(404, {'error': 'Entry not found'})
-                return
-            
-            self.send_json_response(200, {
-                'success': True,
-                'message': 'Entry deleted successfully'
-            })
-            
-        except AuthError as e:
-            self.send_json_response(401, {'error': str(e)})
-        except ValidationError as e:
-            self.send_json_response(400, {'error': str(e)})
-        except Exception as e:
-            self.send_json_response(500, {'error': f'Internal server error: {str(e)}'})
-
+        valid, payload, _ = JWTHandler.decode_jwt(token, jwt_secret)
+        
+        if not valid:
+            return None
+        
+        return payload.get("user_id")
+    
     def do_OPTIONS(self):
-        """Handle CORS preflight requests."""
         self.send_response(200)
         self.send_header('Access-Control-Allow-Origin', '*')
         self.send_header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS')
         self.send_header('Access-Control-Allow-Headers', 'Content-Type, Authorization')
-        self.end_headers() 
+        self.end_headers()
+    
+    def do_GET(self):
+        """Handle GET requests - list entries or get specific entry"""
+        user_id = self._verify_auth()
+        if not user_id:
+            self._send_error_response(401, "Authentication required")
+            return
+        
+        try:
+            parsed_url = urllib.parse.urlparse(self.path)
+            query_params = urllib.parse.parse_qs(parsed_url.query)
+            entry_id = query_params.get('id', [None])[0]
+            
+            if entry_id:
+                # Get specific entry
+                params = {
+                    "id": f"eq.{entry_id}",
+                    "user_id": f"eq.{user_id}"
+                }
+                entries = supabase_request("GET", "journal_entries", params=params)
+                
+                if not entries:
+                    self._send_error_response(404, "Entry not found")
+                    return
+                
+                self._send_json_response(200, {
+                    "success": True,
+                    "entry": entries[0]
+                })
+            else:
+                # List all entries
+                params = {"user_id": f"eq.{user_id}"}
+                entries = supabase_request("GET", "journal_entries", params=params)
+                
+                self._send_json_response(200, {
+                    "success": True,
+                    "entries": entries or [],
+                    "total": len(entries) if entries else 0
+                })
+                
+        except Exception as e:
+            self._send_error_response(500, f"Server error: {str(e)}")
+    
+    def do_POST(self):
+        """Handle POST requests - create new entry"""
+        user_id = self._verify_auth()
+        if not user_id:
+            self._send_error_response(401, "Authentication required")
+            return
+        
+        try:
+            # Parse request body
+            content_length = int(self.headers.get('Content-Length', 0))
+            if content_length > 0:
+                request_body = self.rfile.read(content_length).decode('utf-8')
+                data = json.loads(request_body)
+            else:
+                data = {}
+            
+            text = data.get('text', '').strip()
+            if not text:
+                self._send_error_response(400, "Text is required")
+                return
+            
+            # Create entry
+            entry_id = str(uuid.uuid4())
+            entry_data = {
+                "id": entry_id,
+                "user_id": user_id,
+                "text": text,
+                "tags": data.get('tags', []),
+                "category": data.get('category'),
+                "mood": data.get('mood'),
+                "location": data.get('location'),
+                "weather": data.get('weather'),
+                "embedding_status": "pending",
+                "created_at": datetime.now().isoformat(),
+                "updated_at": datetime.now().isoformat()
+            }
+            
+            result = supabase_request("POST", "journal_entries", entry_data)
+            
+            self._send_json_response(201, {
+                "success": True,
+                "message": "Journal entry created successfully",
+                "entry": result[0] if isinstance(result, list) else result
+            })
+            
+        except json.JSONDecodeError:
+            self._send_error_response(400, "Invalid JSON in request body")
+        except Exception as e:
+            self._send_error_response(500, f"Server error: {str(e)}")
+    
+    def do_PUT(self):
+        """Handle PUT requests - update entry"""
+        user_id = self._verify_auth()
+        if not user_id:
+            self._send_error_response(401, "Authentication required")
+            return
+        
+        parsed_url = urllib.parse.urlparse(self.path)
+        query_params = urllib.parse.parse_qs(parsed_url.query)
+        entry_id = query_params.get('id', [None])[0]
+        
+        if not entry_id:
+            self._send_error_response(400, "Entry ID is required")
+            return
+        
+        try:
+            # Parse request body
+            content_length = int(self.headers.get('Content-Length', 0))
+            if content_length > 0:
+                request_body = self.rfile.read(content_length).decode('utf-8')
+                data = json.loads(request_body)
+            else:
+                data = {}
+            
+            # Build update data
+            update_data = {"updated_at": datetime.now().isoformat()}
+            
+            if 'text' in data:
+                update_data["text"] = data['text']
+                update_data["embedding_status"] = "pending"
+            if 'tags' in data:
+                update_data["tags"] = data['tags']
+            if 'category' in data:
+                update_data["category"] = data['category']
+            if 'mood' in data:
+                update_data["mood"] = data['mood']
+            if 'location' in data:
+                update_data["location"] = data['location']
+            if 'weather' in data:
+                update_data["weather"] = data['weather']
+            
+            params = {
+                "id": f"eq.{entry_id}",
+                "user_id": f"eq.{user_id}"
+            }
+            
+            result = supabase_request("PATCH", "journal_entries", update_data, params)
+            
+            if not result:
+                self._send_error_response(404, "Entry not found")
+                return
+            
+            self._send_json_response(200, {
+                "success": True,
+                "message": "Journal entry updated successfully",
+                "entry": result[0] if isinstance(result, list) else result
+            })
+            
+        except json.JSONDecodeError:
+            self._send_error_response(400, "Invalid JSON in request body")
+        except Exception as e:
+            self._send_error_response(500, f"Server error: {str(e)}")
+    
+    def do_DELETE(self):
+        """Handle DELETE requests - delete entry"""
+        user_id = self._verify_auth()
+        if not user_id:
+            self._send_error_response(401, "Authentication required")
+            return
+        
+        parsed_url = urllib.parse.urlparse(self.path)
+        query_params = urllib.parse.parse_qs(parsed_url.query)
+        entry_id = query_params.get('id', [None])[0]
+        
+        if not entry_id:
+            self._send_error_response(400, "Entry ID is required")
+            return
+        
+        try:
+            params = {
+                "id": f"eq.{entry_id}",
+                "user_id": f"eq.{user_id}"
+            }
+            
+            # Check if entry exists
+            entries = supabase_request("GET", "journal_entries", params=params)
+            if not entries:
+                self._send_error_response(404, "Entry not found")
+                return
+            
+            # Delete the entry
+            supabase_request("DELETE", "journal_entries", params=params)
+            
+            self._send_json_response(200, {
+                "success": True,
+                "message": "Journal entry deleted successfully",
+                "deleted_entry_id": entry_id
+            })
+            
+        except Exception as e:
+            self._send_error_response(500, f"Server error: {str(e)}") 

@@ -1,26 +1,3 @@
-# LifeKB Backend Dependencies (Simplified for Vercel)
-# Purpose: Essential Python packages for serverless functions
-
-# Database and backend services
-supabase==2.0.0
-
-# HTTP client (compatible with supabase)
-httpx==0.24.1
-
-# Data validation
-pydantic==2.5.0
-
-# Authentication and security
-PyJWT==2.8.0
-
-# Environment configuration
-python-dotenv==1.0.0
-
-# Vector operations
-numpy==1.26.2
-
-# Date utilities
-python-dateutil==2.8.2
-
-# AI and embeddings
-openai==0.28.1 
+# LifeKB Production Dependencies
+# Purpose: Zero external dependencies for maximum serverless compatibility
+ 
