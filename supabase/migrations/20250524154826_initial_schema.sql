@@ -1,5 +1,5 @@
--- LifeKB Database Setup Script
--- Purpose: Initialize Supabase database with required tables, functions, and security policies
+-- LifeKB Initial Schema Migration
+-- Purpose: Set up database tables, functions, and security policies for the journaling backend
 
 -- Enable required extensions
 CREATE EXTENSION IF NOT EXISTS vector;
@@ -84,7 +84,7 @@ GRANT USAGE ON SCHEMA public TO anon, authenticated;
 GRANT ALL ON TABLE journal_entries TO authenticated;
 GRANT EXECUTE ON FUNCTION search_entries TO authenticated;
 
--- Create a view for embedding statistics (optional)
+-- Create a view for embedding statistics
 CREATE OR REPLACE VIEW embedding_stats AS
 SELECT 
     user_id,
@@ -99,25 +99,6 @@ GROUP BY user_id;
 -- Grant access to the view
 GRANT SELECT ON embedding_stats TO authenticated;
 
--- Create RLS policy for the view
-ALTER VIEW embedding_stats ENABLE ROW LEVEL SECURITY;
+-- Create RLS policy for the view  
 CREATE POLICY "Users can see own embedding stats" ON embedding_stats
     FOR SELECT USING (auth.uid() = user_id);
-
--- Insert some sample data for testing (optional - remove in production)
--- This will only work if you have test users set up
-DO $$
-DECLARE
-    test_user_id UUID;
-BEGIN
-    -- Only insert if there are existing users (for testing)
-    SELECT id INTO test_user_id FROM auth.users LIMIT 1;
-    
-    IF test_user_id IS NOT NULL THEN
-        INSERT INTO journal_entries (user_id, text, embedding_status) VALUES
-        (test_user_id, 'Today was a great day. I felt really productive at work and had a nice dinner with friends.', 'pending'),
-        (test_user_id, 'Feeling a bit anxious about the upcoming presentation. Need to prepare more.', 'pending'),
-        (test_user_id, 'Had an amazing breakthrough in my project today. The solution was simpler than I thought.', 'pending')
-        ON CONFLICT DO NOTHING;
-    END IF;
-END $$; 
