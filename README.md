@@ -323,3 +323,20 @@ vercel --prod
 ---
 
 **LifeKB** represents a complete transformation from a broken authentication system to a fully functional AI-powered personal knowledge management platform with production users and real semantic search capabilities. 
+
+### 📚 Documentation Structure
+```
+docs/
+├── api/                        # API Documentation
+│   ├── API_DOCUMENTATION.md    # Complete API reference (all endpoints)
+│   ├── rag-api.md              # RAG-specific API documentation  
+│   └── TESTING_RAG.md          # RAG testing guide
+├── RAG_IMPLEMENTATION.md       # Complete RAG feature documentation
+├── Swift_Integration_Guide.md  # 📱 Main iOS development guide
+├── iOS_Security_Guide.md       # 🔐 NEW - iOS security & privacy best practices
+├── iOS_Data_Management_Guide.md # 💾 NEW - Core Data, offline sync, caching
+├── iOS_UX_Implementation_Guide.md # 🎨 NEW - SwiftUI components & UX patterns
+├── authentication.md           # Authentication system details
+├── database-schema.md          # Supabase database structure
+└── deployment.md              # Deployment guides
+``` 
